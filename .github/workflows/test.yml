@@ -11,3 +11,13 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: "${{ matrix.node }}" }
       - run: npm test
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: build the Rust binary
+        run: cargo build --release --manifest-path rust/Cargo.toml
+      - name: run the same tests against the Rust binary
+        run: BRIDGE_BIN="$PWD/rust/target/release/opencode-bridge" node --test test/bridge.test.mjs test/policy.test.mjs test/robust.test.mjs

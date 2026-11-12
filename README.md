@@ -2,7 +2,7 @@
 
 **Let Claude Code hand its easy and medium work to cheaper [opencode](https://opencode.ai) agents, keep the hard work for itself, and see exactly what every opencode session is doing.**
 
-A single-file, zero-dependency [MCP](https://modelcontextprotocol.io) server (Node 18+). It gives Claude Code ten tools:
+A single-file, zero-dependency [MCP](https://modelcontextprotocol.io) server (Node 18+), with an equivalent **Rust implementation** (7 ms start, 6 MB memory; see [rust/](rust/README.md)). It gives Claude Code ten tools:
 
 - **Delegate** a task to an opencode agent (`explorer`, `librarian`, `fixer`, `oracle`, ...) with the delegation policy *enforced by the tool*, not left to a prompt that gets forgotten.
 - **Watch** every opencode session on the machine (the ones you started, the ones your subagents started, the TUI ones): which are running, which failed, what each one said and did.
@@ -38,6 +38,8 @@ claude mcp get opencode-bridge      # Status: ✔ Connected
 ```
 
 `OPENCODE_BRIDGE_ROOT` is the only directory tree delegated tasks may work in. Restart Claude Code once; the tools appear as `mcp__opencode-bridge__opencode_*`. If you use several Claude config directories (`CLAUDE_CONFIG_DIR`), run the `claude mcp add` line once per directory with `CLAUDE_CONFIG_DIR=... claude mcp add ...`.
+
+**Prefer the Rust binary?** Build it with `rust/build.sh` (Docker) or `cargo build --release` and register that binary instead of `node .../server.mjs`; same tools, same environment variables, same tests ([rust/README.md](rust/README.md)).
 
 Then add a short section to your `CLAUDE.md` so Claude prefers the bridge: see [examples/claude-md-snippet.md](examples/claude-md-snippet.md).
 
@@ -133,6 +135,7 @@ All session reads go through `opencode api GET /api/session...`, which talks to 
 ```bash
 npm test                 # 190 offline tests: fake opencode, no network, no tokens
 npm run test:live        # 7 live tests against your real opencode service (spends a few thousand tokens, cleans up after itself)
+BRIDGE_BIN=/path/to/opencode-bridge npm test    # the same suite against the Rust binary
 ```
 
 The offline suite covers the MCP protocol, every tool and every parameter, pagination across pages, state / stale detection, output rendering and truncation, rename, the process table (against a compiled stand-in binary named `opencode`), mode detection from every source and their precedence, tier and agent enforcement per mode, the secret guard, and every error path: provider errors and their classification, the retry rules, timeouts and process-group kills, the parallel limit, oversized prompts, service failures, shutdown. See [docs/TESTING.md](docs/TESTING.md).

@@ -21,7 +21,8 @@ export function startServer({ fake = true, env = {}, root } = {}) {
   const e = { ...process.env, HOME: join(workdir, 'home'), OPENCODE_BRIDGE_ROOT: rootDir, ...env };
   delete e.OPENCODE_MODE; delete e.OPENCODE_BRIDGE_MODE; delete e.CLAUDE_CONFIG_DIR; for (const [k, v] of Object.entries(env)) e[k] = v;
   if (fake) e.PATH = `${FAKE_BIN}:${process.env.PATH}`;
-  const child = spawn(process.execPath, [SERVER], { env: e, stdio: ['pipe', 'pipe', 'pipe'], cwd: workdir });
+  // BRIDGE_BIN=<path> runs the same tests against the Rust binary instead of server.mjs
+  const child = process.env.BRIDGE_BIN ? spawn(process.env.BRIDGE_BIN, [], { env: e, stdio: ['pipe', 'pipe', 'pipe'], cwd: workdir }) : spawn(process.execPath, [SERVER], { env: e, stdio: ['pipe', 'pipe', 'pipe'], cwd: workdir });
   const pending = new Map(); const extra = []; let stderr = '';
   child.stderr.on('data', (d) => { stderr += d; });
   createInterface({ input: child.stdout }).on('line', (l) => {

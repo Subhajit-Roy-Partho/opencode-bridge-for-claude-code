@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.0
+- **Rust implementation** in `rust/` (the Node original is kept as the reference): the same ten tools and texts, the same 190 offline and 7 live tests, 7 ms start-up and 6 MB memory instead of 35 ms and 55 MB. The tool schemas, policy texts, error patterns and instructions are exported from `server.mjs` to `rust/data/texts.json` (`rust/tools/dump_texts.mjs`); `test/texts-sync.test.mjs` keeps them from drifting.
+- `BRIDGE_BIN=<binary>` runs the test suites against the Rust binary; CI builds and tests both.
+- `server.mjs` only starts its stdio loop when run directly, so it can be imported to read its shared constants.
+
 ## 0.4.0
 Robustness release: every failure mode that was found in the real opencode is handled, tested, and documented ([docs/ERRORS.md](docs/ERRORS.md)).
 - **Provider errors**: opencode `error` events and stderr are parsed and classified (`rate_limit`, `quota`, `context_length`, `output_limit`, `overloaded`, `auth`, `model`, `agent`, `invalid_request`, `network`, `timeout`, `spawn`, `exit`) and reported by `opencode_status` / `opencode_result` with advice. Before, a bad model or agent ended as an empty "failed".

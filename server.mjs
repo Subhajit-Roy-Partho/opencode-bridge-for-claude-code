@@ -23,7 +23,7 @@ import { realpathSync, readFileSync, existsSync, mkdtempSync, writeFileSync, rmS
 import { homedir, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
 // Model for delegated runs (provider/model[#variant]). Unset = no -m flag, i.e. opencode's own default model.
 const DEFAULT_MODEL = process.env.OPENCODE_BRIDGE_MODEL || '';
 // Workers may only operate inside this root (set per-registration).
@@ -541,6 +541,11 @@ async function call(name, a) {
   }
 }
 
+// Run the stdio server only when started directly (`node server.mjs`); importing the file (rust/tools/dump_texts.mjs) just exposes the texts.
+const isMain = (() => { try { return realpathSync(process.argv[1]) === realpathSync(new URL(import.meta.url).pathname); } catch { return false; } })();
+export const __shared = { AGENT_RULE, tools, INSTRUCTIONS, MODE_RULES, TIER_RULE, VERIFY_RULE, ROSTER, KINDS, SECRET_RES, GUARD, GUARD_LANES, READ_ONLY, EDITORS, STALE_MIN };
+
+if (isMain) {
 // ---------- protocol loop, shutdown, last-resort guards ----------
 const send = (m) => { try { process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...m }) + '\n'); } catch {} };
 let closing = false;
@@ -569,3 +574,4 @@ process.stdout.on('error', (e) => { if (e?.code === 'EPIPE') shutdown(0); });
 process.on('uncaughtException', (e) => { try { process.stderr.write(`opencode-bridge: uncaught ${e?.stack ?? e}\n`); } catch {} });
 process.on('unhandledRejection', (e) => { try { process.stderr.write(`opencode-bridge: unhandled rejection ${e?.stack ?? e}\n`); } catch {} });
 process.on('exit', () => tasks.forEach((t) => { if (live(t)) killGroup(t, 'SIGKILL'); cleanupTmp(t); }));
+}

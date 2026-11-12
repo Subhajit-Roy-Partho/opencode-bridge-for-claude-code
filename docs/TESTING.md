@@ -5,6 +5,8 @@ npm test             # offline: 190 tests, ~25 s, no network, no tokens
 npm run test:live    # live: 7 tests against your real opencode service
 ```
 
+The same suites run against either implementation: `BRIDGE_BIN=/path/to/opencode-bridge npm test` uses the Rust binary instead of `server.mjs` (`test/texts-sync.test.mjs` checks that the texts embedded in the binary match the Node original).
+
 ## Offline suite (`test/bridge.test.mjs`, `test/policy.test.mjs`, `test/robust.test.mjs`)
 
 Runs `server.mjs` over stdio (a real MCP client, `test/helpers.mjs`) with `test/bin/opencode` first on `PATH`. That file is a **fake opencode** with deterministic fixtures: 130 sessions across two pages (running, recent-no-active-flag, stale, active-but-old, succeeded / failed / interrupted, children, auto-named and convention-named), rich message histories (encrypted reasoning blobs, completed and running tool calls, array and object results, a 9000-character answer), title persistence for `PATCH`, and failure switches (`FAKE_FAIL`, `FAKE_NONJSON`, `FAKE_ACTIVE_FAIL`, `FAKE_EXIT`, `FAKE_SLEEP`). Every test uses a private `HOME` and clears the mode variables, so your own `~/.claude/insensitive` cannot change results.

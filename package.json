@@ -1,6 +1,6 @@
 {
   "name": "opencode-bridge-for-claude-code",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "MCP bridge that lets Claude Code delegate easy/medium work to opencode agents, enforces the routing modes, and shows every opencode session and its output.",
   "type": "module",
   "main": "server.mjs",
@@ -12,9 +12,9 @@
   "keywords": ["claude-code", "opencode", "mcp", "model-context-protocol", "delegation", "agents", "subagents"],
   "engines": { "node": ">=18" },
   "scripts": {
-    "test": "node --test test/bridge.test.mjs test/policy.test.mjs test/robust.test.mjs",
+    "test": "node --test test/bridge.test.mjs test/policy.test.mjs test/robust.test.mjs test/texts-sync.test.mjs",
     "test:live": "OPENCODE_BRIDGE_LIVE=1 node --test test/live.test.mjs",
     "start": "node server.mjs"
   },
-  "files": ["server.mjs", "README.md", "LICENSE", "docs", "examples"]
+  "files": ["server.mjs", "README.md", "LICENSE", "docs", "examples", "rust"]
 }
