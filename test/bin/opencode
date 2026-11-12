@@ -1,0 +1,109 @@
+#!/usr/bin/env node
+// Fake `opencode` for the bridge tests. Implements just enough of `opencode api METHOD path[?query] [-d body]` and
+// `opencode run ...` to exercise server.mjs deterministically. Fixture: 130 sessions, newest first (see sessionAt()).
+//   FAKE_LOG=<file>    append one JSON line per invocation: {argv, body?}
+//   FAKE_STATE=<file>  persist title changes (PATCH) between invocations
+//   FAKE_FAIL=1        every `api` call exits 1 with "boom";   FAKE_NONJSON=1  prints garbage
+//   FAKE_ACTIVE_FAIL=1 only GET /api/session/active fails
+//   FAKE_SLEEP=<s>     `run` waits that long;  FAKE_EXIT=<n>  exit code of `run`
+import { appendFileSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+const argv = process.argv.slice(2);
+const env = process.env;
+const now = Date.now(), MIN = 60000;
+const log = (o) => env.FAKE_LOG && appendFileSync(env.FAKE_LOG, JSON.stringify(o) + '\n');
+
+const AGENTS = ['explorer', 'fixer', 'librarian', 'oracle', 'deep-research', 'designer', 'general'];
+const DIRS = ['/home/u/Github/project-a', '/home/u/Github/project-b', '/data/x/project-c'];
+const PFX = ['BETA', 'GAMMA', 'DOCS-SYNC', 'ALPHA'];
+const N = 130;
+function sessionAt(i) {
+  const updated = i === 0 ? now - 1 * MIN : i === 1 ? now - 2 * MIN : now - (120 + (i - 2) * 3) * MIN;
+  const s = { id: `ses_${String(i).padStart(3, '0')}`, projectID: 'p' + (i % 3), agent: AGENTS[i % 7], model: { id: 'muse', providerID: 'opencode-go', variant: 'xhigh' }, cost: 0,
+    tokens: { input: 1000 * (i + 1), output: 10 * (i + 1), reasoning: 5, cache: { read: 0, write: 0 } },
+    time: { created: updated - 5 * MIN, updated, busy: updated - 4 * MIN }, location: { directory: DIRS[i % 3] } };
+  if (i === 0) { s.agent = 'deep-research'; s.title = 'ALPHA/deep-research: api reference notes'; s.location.directory = DIRS[0]; }
+  else if (i === 1) { s.agent = 'fixer'; s.title = 'BETA/fixer: running no active flag'; s.location.directory = DIRS[0]; }
+  else if (i === 2) { s.agent = 'explorer'; s.title = 'GAMMA/explorer: stale one'; s.location.directory = DIRS[0]; }
+  else if (i === 3) { s.agent = 'oracle'; s.title = 'DOCS-SYNC/oracle: old but in active list'; s.location.directory = DIRS[1]; }
+  else {
+    s.outcome = ['succeeded', 'succeeded', 'failed', 'interrupted', 'succeeded'][i % 5];
+    s.title = i % 7 === 0 ? `Some auto title ${i}` : `${PFX[i % 4]}/${s.agent}: task ${i}`;
+    if (i % 10 === 0) s.parentID = 'ses_parent';
+  }
+  return s;
+}
+let titles = {}; if (env.FAKE_STATE && existsSync(env.FAKE_STATE)) titles = JSON.parse(readFileSync(env.FAKE_STATE, 'utf8'));
+const session = (i) => { const s = sessionAt(i); if (titles[s.id]) s.title = titles[s.id]; return s; };
+const ids = () => Array.from({ length: N }, (_, i) => i);
+const idx = (id) => { const m = /^ses_(\d{3})$/.exec(id); const i = m ? Number(m[1]) : -1; return i >= 0 && i < N ? i : -1; };
+
+const t0 = 1700000000000; // fixed: message timestamps must not change between two invocations
+const mk = (n, o) => ({ id: `msg_${n}`, time: { created: t0 + n * 1000, ...(o.time || {}) }, ...o });
+function messages(i) { // chronological
+  if (i === 0) return [
+    mk(1, { type: 'agent-switched', agent: 'deep-research', previous: 'deep-research' }),
+    mk(2, { type: 'user', text: 'Do the thing\nsecond line of the prompt', files: [] }),
+    mk(3, { type: 'synthetic', text: 'Your last response hit the output token limit.' }),
+    mk(4, { type: 'assistant', agent: 'deep-research', content: [
+      { type: 'reasoning', text: '', native: { reasoningEncryptedContent: 'SECRETBLOB-AAAA' } },
+      { type: 'text', text: 'plan text: look at three papers' },
+      { type: 'tool', name: 'execute', state: { status: 'completed', input: { code: 'const x = await fetch("https://example.org/" + "a".repeat(400))' }, content: [{ type: 'text', text: 'R'.repeat(500) }], metadata: {} } }] }),
+    mk(5, { type: 'assistant', agent: 'deep-research', content: [{ type: 'tool', name: 'bash', state: { status: 'running', input: { command: 'sleep 99' } } }] }),
+    mk(6, { type: 'assistant', agent: 'deep-research', content: [{ type: 'reasoning', text: 'thinking about it', native: { reasoningEncryptedContent: 'SECRETBLOB-BBBB' } }] }),
+    mk(7, { type: 'assistant', agent: 'deep-research', content: [{ type: 'tool', name: 'read', state: { status: 'completed', input: { path: '/x' }, content: { lines: 3, note: 'object result' } } }] }),
+    mk(8, { type: 'assistant', agent: 'deep-research', content: [{ type: 'text', text: 'FINAL ANSWER line1\nline2' }] }),
+    mk(9, { type: 'idle', outcome: 'succeeded' }),
+  ];
+  if (i === 1) return [mk(1, { type: 'user', text: 'go' }), mk(2, { type: 'assistant', agent: 'fixer', content: [{ type: 'tool', name: 'bash', state: { status: 'running', input: { command: 'make' } } }] })];
+  if (i === 2) return [];
+  if (i === 3) return [mk(1, { type: 'user', text: 'long' }), mk(2, { type: 'assistant', agent: 'oracle', content: [{ type: 'text', text: 'A'.repeat(9000) + 'THE-END' }] })];
+  if (i === 4) return Array.from({ length: 150 }, (_, k) => mk(k + 1, k % 2 ? { type: 'assistant', agent: 'x', content: [{ type: 'text', text: `reply ${k}` }] } : { type: 'user', text: `ask ${k}` }));
+  return [mk(1, { type: 'user', text: `prompt ${i}` }), mk(2, { type: 'assistant', agent: AGENTS[i % 7], content: [{ type: 'text', text: `answer ${i}` }] }), mk(3, { type: 'idle', outcome: 'succeeded' })];
+}
+
+function out(o) { process.stdout.write(JSON.stringify(o)); }
+function fail(msg, code = 1) { process.stderr.write(msg + '\n'); process.exit(code); }
+
+if (argv[0] === 'api') {
+  const method = argv[1]; const url = new URL(argv[2], 'http://x'); const di = argv.indexOf('-d'); const body = di >= 0 ? JSON.parse(argv[di + 1]) : undefined;
+  log({ argv, method, path: url.pathname, query: Object.fromEntries(url.searchParams), body });
+  if (env.FAKE_FAIL === '1') fail('boom');
+  if (env.FAKE_NONJSON === '1') { process.stdout.write('garbage not json'); process.exit(0); }
+  const p = url.pathname, q = url.searchParams;
+  if (method === 'GET' && p === '/api/session/active') {
+    if (env.FAKE_ACTIVE_FAIL === '1') fail('active failed');
+    out({ data: { ses_000: { status: 'busy' }, ses_003: { status: 'busy' } } }); process.exit(0);
+  }
+  if (method === 'GET' && p === '/api/session') {
+    let all = ids().map(session);
+    if (q.get('archived') === 'true') all = [];
+    if (q.get('search')) all = all.filter((s) => s.title.toLowerCase().includes(q.get('search').toLowerCase()));
+    if (q.get('directory')) all = all.filter((s) => s.location.directory === q.get('directory'));
+    const limit = Number(q.get('limit') || 50), off = q.get('cursor') ? Number(Buffer.from(q.get('cursor'), 'base64url').toString()) : 0;
+    const page = all.slice(off, off + limit);
+    out({ data: page, cursor: { previous: off ? Buffer.from(String(Math.max(0, off - limit))).toString('base64url') : null, next: off + limit < all.length ? Buffer.from(String(off + limit)).toString('base64url') : null } }); process.exit(0);
+  }
+  let m = /^\/api\/session\/([^/]+)$/.exec(p);
+  if (m) {
+    const i = idx(m[1]); if (i < 0) fail('HTTP 404 Not Found');
+    if (method === 'GET') { out({ data: session(i) }); process.exit(0); }
+    if (method === 'PATCH') { if (!env.FAKE_STATE) fail('no state'); titles[session(i).id] = body.title; writeFileSync(env.FAKE_STATE, JSON.stringify(titles)); process.exit(0); } // 204: empty body
+  }
+  m = /^\/api\/session\/([^/]+)\/message$/.exec(p);
+  if (m && method === 'GET') {
+    const i = idx(m[1]); if (i < 0) fail('HTTP 404 Not Found');
+    const lim = Number(q.get('limit') || 50);
+    out({ data: messages(i).reverse().slice(0, lim), cursor: { previous: null, next: null } }); process.exit(0);
+  }
+  fail('HTTP 404 Not Found');
+}
+
+if (argv[0] === 'run') {
+  log({ argv, cwd: process.cwd(), pwd: env.PWD, config: env.OPENCODE_CONFIG_CONTENT ? 'set' : 'unset' });
+  const sid = argv.includes('-s') ? argv[argv.indexOf('-s') + 1] : 'ses_fake01';
+  const emit = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+  emit({ type: 'step_start', sessionID: sid, part: {} });
+  emit({ type: 'text', sessionID: sid, part: { text: 'hello ' } });
+  const done = () => { emit({ type: 'text', sessionID: sid, part: { text: 'world' } }); if (env.FAKE_EXIT && env.FAKE_EXIT !== '0') { process.stderr.write('fake failure\n'); process.exit(Number(env.FAKE_EXIT)); } process.exit(0); };
+  if (env.FAKE_SLEEP) setTimeout(done, Number(env.FAKE_SLEEP) * 1000); else done();
+} else if (argv[0] !== 'api') fail('fake opencode: unsupported ' + argv.join(' '));
