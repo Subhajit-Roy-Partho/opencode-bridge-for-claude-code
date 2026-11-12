@@ -141,7 +141,7 @@ const INSTRUCTIONS = [
   'TIERS: ' + TIER_RULE,
   'WORKFLOW: opencode_start needs tier (easy|medium) and agent (' + Object.keys(ROSTER).join('|') + '); then poll opencode_status / opencode_result; see all sessions with opencode_sessions (state=running for what is active now) and read one with opencode_session_output. ' + VERIFY_RULE,
   'LIMITS AND ERRORS: at most OPENCODE_BRIDGE_MAX_PARALLEL tasks run at once (default 6) and each has a timeout (default 120 min, process group killed). Failures are classified in opencode_result (rate_limit, quota, context_length, output_limit, overloaded, auth, model, agent, invalid_request, network, timeout, spawn, exit) with advice. Only TRANSIENT errors (rate_limit, overloaded, network) of READ-ONLY agents that produced no output are retried automatically with backoff; an editing agent is never replayed. quota / auth / context_length / invalid_request are not retried: switch model, split the task, or keep the work on Claude. Prompts over ~100 KB are attached as a file.',
-  'NAMING: every session title is "<LANE>/<agent>: <task>" (e.g. ALPHA/deep-research: collect API notes); opencode_start sets it, opencode_session_rename fixes old ones. The agent roster (explorer, librarian, deep-research, oracle, fixer, designer, general) comes from the opencode-config repository (https://github.com/Subhajit-Roy-Partho/opencode-config); without it only the built-in "worker" agent exists.',
+  'NAMING: every session title is "<LANE>/<agent>: <task>" (e.g. ALPHA/deep-research: collect API notes); opencode_start sets it, opencode_session_rename fixes old ones. The agent roster (explorer, librarian, deep-research, oracle, fixer, designer, general) comes from the opencode-config repository (https://github.com/Subhajit-Roy-Partho/opencode-config/tree/v2); without it only the built-in "worker" agent exists.',
 ].join('\n\n');
 
 const S = { type: 'string' }, N = { type: 'number' }, B = { type: 'boolean' };
@@ -318,7 +318,7 @@ function policy({ cwd = ROOT, mode } = {}) {
     'ROSTER:\n' + Object.entries(ROSTER).map(([k, v]) => `  ${k.padEnd(14)} ${v}`).join('\n'), '',
     `LIMITS: ${MAX_PARALLEL} parallel tasks, timeout ${DEFAULT_TIMEOUT_MIN} min, ${MAX_RETRIES} automatic retries (read-only agents, transient errors only), tool output capped at ${RESPONSE_CAP} characters. Error kinds and advice: see opencode_result.`, '',
     'Detection order (SENSITIVE wins): env OPENCODE_BRIDGE_MODE / OPENCODE_MODE; <project>/.claude/sensitive; <project>/.claude/insensitive; ~/.claude/insensitive and $CLAUDE_CONFIG_DIR/insensitive; the `mode` argument when the user asked. Default: blueprint.',
-    'Roster agents are defined in https://github.com/Subhajit-Roy-Partho/opencode-config (install it as ~/.config/opencode). Policy text: "OpenCode Specialist Delegation" in CLAUDE.md.'].join('\n');
+    'Roster agents are defined in https://github.com/Subhajit-Roy-Partho/opencode-config/tree/v2 (install it as ~/.config/opencode). Policy text: "OpenCode Specialist Delegation" in CLAUDE.md.'].join('\n');
 }
 
 const get = (id) => { const t = tasks.get(String(id ?? '')); if (!t) throw new Error('unknown task (opencode_list shows this bridge\'s tasks; for any other session use opencode_sessions)'); return t; };

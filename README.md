@@ -8,7 +8,7 @@ A single-file, zero-dependency [MCP](https://modelcontextprotocol.io) server (No
 - **Watch** every opencode session on the machine (the ones you started, the ones your subagents started, the TUI ones): which are running, which failed, what each one said and did.
 - **Name** sessions consistently (`LANE/agent: task`) so a list of forty sessions is readable.
 
-> **Companion repository: [opencode-config](https://github.com/Subhajit-Roy-Partho/opencode-config).** The agent roster this bridge delegates to (`explorer`, `librarian`, `deep-research`, `oracle`, `fixer`, `designer`) and the opencode-side routing rules live there. Install it as `~/.config/opencode` first. Without it only the bridge's built-in `worker` agent exists and most of what makes the delegation useful is missing.
+> **Companion repository: [opencode-config](https://github.com/Subhajit-Roy-Partho/opencode-config/tree/v2).** The agent roster this bridge delegates to (`explorer`, `librarian`, `deep-research`, `oracle`, `fixer`, `designer`) and the opencode-side routing rules live there. Install it as `~/.config/opencode` first. Without it only the bridge's built-in `worker` agent exists and most of what makes the delegation useful is missing.
 
 ## Why
 
@@ -20,9 +20,13 @@ Delegating to a cheaper model saves tokens only if it is done with discipline: s
 
 ## Quick start
 
-Requirements: Node.js >= 18, opencode **v2** with its background service (tested with 2.2.7; the bridge uses the `opencode api` command and the `/api/session` routes), the [opencode-config](https://github.com/Subhajit-Roy-Partho/opencode-config) agents, and a C compiler only if you want to run the process tests.
+Requirements: Node.js >= 18, opencode **v2** with its background service (tested with 2.2.7; the bridge uses the `opencode api` command and the `/api/session` routes), the [opencode-config](https://github.com/Subhajit-Roy-Partho/opencode-config/tree/v2) agents, and a C compiler only if you want to run the process tests.
 
 ```bash
+# 1. the opencode side: agent roster and routing rules. The roster is on the v2 branch (the default branch is older)
+git clone -b v2 https://github.com/Subhajit-Roy-Partho/opencode-config ~/.config/opencode     # back up an existing ~/.config/opencode first
+
+# 2. the bridge
 git clone https://github.com/Subhajit-Roy-Partho/opencode-bridge-for-claude-code ~/.claude/mcp/opencode-bridge
 
 claude mcp add --scope user opencode-bridge \
@@ -142,7 +146,7 @@ The offline suite covers the MCP protocol, every tool and every parameter, pagin
 
 ## Prior art
 
-Other MCP servers for opencode exist, for example [nosolosoft/opencode-mcp](https://github.com/nosolosoft/opencode-mcp) and several listed on Glama. They mostly wrap the older HTTP API with basic auth. This one targets the v2 service through `opencode api`, adds the policy enforcement and the naming convention, and is designed for the [opencode-config](https://github.com/Subhajit-Roy-Partho/opencode-config) agent roster.
+Other MCP servers for opencode exist, for example [nosolosoft/opencode-mcp](https://github.com/nosolosoft/opencode-mcp) and several listed on Glama. They mostly wrap the older HTTP API with basic auth. This one targets the v2 service through `opencode api`, adds the policy enforcement and the naming convention, and is designed for the [opencode-config](https://github.com/Subhajit-Roy-Partho/opencode-config/tree/v2) agent roster.
 
 ## License
 

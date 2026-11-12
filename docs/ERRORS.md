@@ -16,7 +16,7 @@ Everything below was observed in the real opencode (v2.2.7) or is a limit of the
 | `context_length` | `maximum context length ...` | no | split the task, attach less, start a fresh session |
 | `output_limit` | `output token limit`, stop reason length | no | ask for smaller pieces or for a file |
 | `model` | `provider.no-route: Model unavailable: x` | no | fix `OPENCODE_BRIDGE_MODEL` / `model` (`opencode models`) |
-| `agent` | `Agent not found: "x"` | no | install [opencode-config](https://github.com/Subhajit-Roy-Partho/opencode-config) or use `worker` |
+| `agent` | `Agent not found: "x"` | no | install [opencode-config](https://github.com/Subhajit-Roy-Partho/opencode-config/tree/v2) or use `worker` |
 | `invalid_request` | `provider.invalid-request` (e.g. unsupported `tool_choice`) | no | another model or agent |
 | `timeout` | no result within `timeout_minutes` | no | split the task or raise the limit |
 | `spawn` | opencode not on `PATH`, argument list too long | no | install opencode; (large prompts are attached automatically) |

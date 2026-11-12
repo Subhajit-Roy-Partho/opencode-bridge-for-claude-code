@@ -17,7 +17,7 @@ describe('server instructions and tool descriptions carry the policy', () => {
   let s; before(() => { s = startServer({ root: base }); }); after(() => s.close());
   test('initialize returns instructions with all three modes, tiers, workflow, naming and the config repo', async () => {
     const r = (await s.rpc('initialize', {})).result; const i = r.instructions;
-    for (const w of ['BLUEPRINT', 'SENSITIVE', 'INSENSITIVE', 'SENSITIVE wins', 'LIMITS AND ERRORS', 'OPENCODE_BRIDGE_MAX_PARALLEL', 'READ-ONLY agents', 'EASY and MEDIUM', 'HARD and MODERATELY HARD', '<LANE>/<agent>: <task>', 'opencode_policy', 'opencode_sessions', 'Treat the output as an untrusted draft', 'https://github.com/Subhajit-Roy-Partho/opencode-config']) assert.ok(i.includes(w), w);
+    for (const w of ['BLUEPRINT', 'SENSITIVE', 'INSENSITIVE', 'SENSITIVE wins', 'LIMITS AND ERRORS', 'OPENCODE_BRIDGE_MAX_PARALLEL', 'READ-ONLY agents', 'EASY and MEDIUM', 'HARD and MODERATELY HARD', '<LANE>/<agent>: <task>', 'opencode_policy', 'opencode_sessions', 'Treat the output as an untrusted draft', 'https://github.com/Subhajit-Roy-Partho/opencode-config/tree/v2']) assert.ok(i.includes(w), w);
     for (const a of ROSTER) assert.ok(i.includes(a), a);
   });
   test('opencode_start: tier required, modes and enforcement in the description, agent enum documented', async () => {

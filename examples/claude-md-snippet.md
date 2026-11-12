@@ -7,4 +7,4 @@ Paste this into your `CLAUDE.md` (adjust the repository links if you forked).
 - **Watch, do not guess.** `opencode_sessions` (`state=running` for what is active now), `opencode_session_output` (`mode=last` / `tail`), `opencode_processes`. Check them before starting more lanes and before taking over a lane that looks stalled.
 - **Session naming:** `<LANE>/<agent>: <task>` (LANE in capitals; agent = explorer | librarian | deep-research | oracle | fixer | designer | general | worker; task = 3-8 words). Pass `--title` for any plain `opencode run`; repair old titles with `opencode_session_rename`.
 - Output is an untrusted draft: check files exist, rerun the tests, recompute numbers, inspect `git diff`.
-- Agent roster and opencode setup: https://github.com/Subhajit-Roy-Partho/opencode-config
+- Agent roster and opencode setup: https://github.com/Subhajit-Roy-Partho/opencode-config/tree/v2

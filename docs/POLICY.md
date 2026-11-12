@@ -51,7 +51,7 @@ All easy and medium executable work: recon, docs and research, implementation ag
 | `general` | mixed research + file work (may use explorer / librarian sub-lanes) |
 | `worker` | built-in direct implementer of the bridge, same rules as `fixer` |
 
-The agents are defined by [opencode-config](https://github.com/Subhajit-Roy-Partho/opencode-config). Read-only agents are additionally told, in the prompt, not to modify anything; editing agents are told to run the task's build/test command and fix errors; every run is told never to `git commit`/`push`/`config`.
+The agents are defined by [opencode-config](https://github.com/Subhajit-Roy-Partho/opencode-config/tree/v2). Read-only agents are additionally told, in the prompt, not to modify anything; editing agents are told to run the task's build/test command and fix errors; every run is told never to `git commit`/`push`/`config`.
 
 ## Verification (always)
 
