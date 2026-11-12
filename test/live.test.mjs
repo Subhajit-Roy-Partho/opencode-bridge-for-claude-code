@@ -42,8 +42,26 @@ describe('live service', { skip }, () => {
     assert.match(await s.text('opencode_sessions', { title_prefix: `${lane}/`, state: 'finished' }), /renamed by test/);
     if (proc) assert.match(proc, new RegExp(`${lane}/explorer`)); // the process row carried the exact title
   });
+  test('a bad model fails cleanly with kind "model" and advice (real opencode error event), nothing is retried', async () => {
+    const out = await s.text('opencode_start', { prompt: 'say hi', tier: 'easy', agent: 'explorer', lane, cwd: root, model: 'bogus/nomodel' });
+    const task = out.match(/task (\w+) started/)[1];
+    const st = await waitFor(async () => { const x = await s.text('opencode_status', { id: task }); return /^failed/.test(x) && x; }, 60000, 300);
+    assert.match(st, /^failed \(model\)/); const r = await s.text('opencode_result', { id: task });
+    assert.match(r, /^\[failed: model\]\nprovider\.no-route: Model unavailable: bogus\/nomodel\nAdvice: Model unavailable/); assert.ok(!/attempt/.test(st));
+    const sid = st.match(/session (ses_\w+)/)?.[1]; if (sid) created.add(sid);
+  });
+  test('a prompt over 100 KB is attached as a file and the agent really reads it', async () => {
+    const big = 'PADDING '.repeat(15000) + '\nIMPORTANT: reply with exactly the single word MANGO and nothing else. Do not use tools.';
+    const out = await s.text('opencode_start', { prompt: big, tier: 'easy', agent: 'explorer', lane, cwd: root }); assert.match(out, /sent as an attached file/);
+    const task = out.match(/task (\w+) started/)[1];
+    await waitFor(async () => /^done|^failed/.test(await s.text('opencode_status', { id: task })), 240000, 1000);
+    const st = await s.text('opencode_status', { id: task }); const sid = st.match(/session (ses_\w+)/)?.[1]; if (sid) created.add(sid);
+    assert.match(st, /^done/); assert.match(await s.text('opencode_result', { id: task }), /MANGO/i);
+  });
   test('a hard task is refused before anything is started', async () => {
+    const count = async () => (await s.text('opencode_sessions', { title_prefix: `${lane}/`, limit: 50 })).split('\n')[0].match(/^(\d+) session/)[1];
+    const before = await count();
     const r = await s.call('opencode_start', { prompt: 'x', tier: 'hard', agent: 'explorer', cwd: root }); assert.equal(r.isError, true);
-    await sleep(500); assert.equal((await s.text('opencode_sessions', { title_prefix: `${lane}/`, limit: 50 })).split('\n').length - 1 <= 1, true);
+    assert.match(r.content[0].text, /tier "hard" stays on Claude/); await sleep(500); assert.equal(await count(), before, 'no session was created');
   });
 });

@@ -116,7 +116,7 @@ describe('own tasks: start / status / result / cancel / list', () => {
     try {
       const id = (await s2.text('opencode_start', { tier: 'easy', prompt: 'p' })).match(/task (\w+)/)[1];
       await waitFor(async () => /^failed/.test(await s2.text('opencode_status', { id })));
-      assert.match(await s2.text('opencode_result', { id }), /\[failed\]\nhello world/);
+      assert.match(await s2.text('opencode_result', { id }), /^\[failed: exit\]\nfake failure\n--- partial output ---\nhello world$/);
     } finally { s2.close(); }
   });
   test('running worker: result shows partial text; cancel kills it; status cancelled', async () => {

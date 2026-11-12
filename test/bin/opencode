@@ -6,7 +6,13 @@
 //   FAKE_FAIL=1        every `api` call exits 1 with "boom";   FAKE_NONJSON=1  prints garbage
 //   FAKE_ACTIVE_FAIL=1 only GET /api/session/active fails
 //   FAKE_SLEEP=<s>     `run` waits that long;  FAKE_EXIT=<n>  exit code of `run`
-import { appendFileSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+//   run: FAKE_ERR_TYPE / FAKE_ERR_MSG  emit a JSON error event like the real opencode ({"type":"error","error":{type,message}}) and exit 1
+//        FAKE_TEXT_FIRST=1 emit text before the error;  FAKE_ERR_EXIT0=1 exit 0 despite the error event;  FAKE_FAIL_TIMES=<n> + FAKE_COUNT_FILE=<f>: only the first n runs fail
+//        FAKE_NOTERM=1 ignore SIGTERM;  FAKE_CHILD_PIDFILE=<f> start a child `sleep` in the same process group and write its pid
+//        FAKE_BIGOUT=<MB> emit that many MB of text;  FAKE_STDERR_ONLY=<msg> fail with that stderr line and no events
+//   api: FAKE_API_ECONN=1 / FAKE_API_401=1 / FAKE_API_SLEEP=<ms> / FAKE_API_FLAKY=<file> (first call fails with ECONNRESET)
+import { appendFileSync, readFileSync, writeFileSync, existsSync, statSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 const argv = process.argv.slice(2);
 const env = process.env;
 const now = Date.now(), MIN = 60000;
@@ -56,12 +62,17 @@ function messages(i) { // chronological
   ];
   if (i === 1) return [mk(1, { type: 'user', text: 'go' }), mk(2, { type: 'assistant', agent: 'fixer', content: [{ type: 'tool', name: 'bash', state: { status: 'running', input: { command: 'make' } } }] })];
   if (i === 2) return [];
+  if (i === 12) return [mk(1, { type: 'user', text: 'go' }), mk(2, { type: 'assistant', agent: 'x', finish: 'error', error: { type: 'provider.invalid-request', message: 'only "auto" is supported for tool_choice' }, content: [] }), mk(3, { type: 'idle', outcome: 'failed', error: { type: 'provider.invalid-request', message: 'only "auto" is supported for tool_choice' } })];
+  if (i === 17) return [mk(1, { type: 'user', text: 'go' }), mk(2, { type: 'assistant', agent: 'x', finish: 'error', error: 'maximum context length is 128000 tokens, you sent 300000', content: [] }), mk(3, { type: 'idle', outcome: 'failed', error: 'maximum context length is 128000 tokens, you sent 300000' })];
+  if (i === 11) return [mk(1, { type: 'user', text: 'go' }), mk(2, { type: 'assistant', agent: 'x', finish: 'length', content: [{ type: 'text', text: 'partial answer' }] }), mk(3, { type: 'synthetic', text: 'Your last response hit the output token limit (stop reason: length).' }), mk(4, { type: 'idle', outcome: 'succeeded' })];
   if (i === 3) return [mk(1, { type: 'user', text: 'long' }), mk(2, { type: 'assistant', agent: 'oracle', content: [{ type: 'text', text: 'A'.repeat(9000) + 'THE-END' }] })];
   if (i === 4) return Array.from({ length: 150 }, (_, k) => mk(k + 1, k % 2 ? { type: 'assistant', agent: 'x', content: [{ type: 'text', text: `reply ${k}` }] } : { type: 'user', text: `ask ${k}` }));
   return [mk(1, { type: 'user', text: `prompt ${i}` }), mk(2, { type: 'assistant', agent: AGENTS[i % 7], content: [{ type: 'text', text: `answer ${i}` }] }), mk(3, { type: 'idle', outcome: 'succeeded' })];
 }
 
 function out(o) { process.stdout.write(JSON.stringify(o)); }
+const wr = (s) => new Promise((r) => process.stdout.write(s, r));   // awaited write: a pipe must be drained before the process exits
+const bye = (n) => process.stdout.write('', () => process.exit(n));
 function fail(msg, code = 1) { process.stderr.write(msg + '\n'); process.exit(code); }
 
 if (argv[0] === 'api') {
@@ -69,6 +80,11 @@ if (argv[0] === 'api') {
   log({ argv, method, path: url.pathname, query: Object.fromEntries(url.searchParams), body });
   if (env.FAKE_FAIL === '1') fail('boom');
   if (env.FAKE_NONJSON === '1') { process.stdout.write('garbage not json'); process.exit(0); }
+  if (env.FAKE_API_ECONN === '1') fail('Error: Could not reach server at http://127.0.0.1:9: ECONNREFUSED: Unable to connect.\n    at cli.server-connection.resolve (/$bunfs/root/chunk-x.js:2:1066)\n    at cli.api (/$bunfs/root/chunk-y.js:7:21641)');
+  if (env.FAKE_API_HUGE) { for (let i = 0; i < Number(env.FAKE_API_HUGE); i++) await wr('x'.repeat(1_000_000)); bye(0); await new Promise(() => {}); }
+  if (env.FAKE_API_401 === '1') fail('HTTP 401 Unauthorized');
+  if (env.FAKE_API_FLAKY && !existsSync(env.FAKE_API_FLAKY)) { writeFileSync(env.FAKE_API_FLAKY, '1'); fail('Error: read ECONNRESET'); }
+  if (env.FAKE_API_SLEEP) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(env.FAKE_API_SLEEP));
   const p = url.pathname, q = url.searchParams;
   if (method === 'GET' && p === '/api/session/active') {
     if (env.FAKE_ACTIVE_FAIL === '1') fail('active failed');
@@ -99,11 +115,25 @@ if (argv[0] === 'api') {
 }
 
 if (argv[0] === 'run') {
-  log({ argv, cwd: process.cwd(), pwd: env.PWD, config: env.OPENCODE_CONFIG_CONTENT ? 'set' : 'unset' });
+  const fi = argv.indexOf('-f'); let attached;
+  if (fi >= 0) { const f = argv[fi + 1]; attached = { path: f, bytes: statSync(f).size, mode: (statSync(f).mode & 0o777).toString(8), head: readFileSync(f, 'utf8').slice(0, 40) }; }
+  log({ argv, cwd: process.cwd(), pwd: env.PWD, config: env.OPENCODE_CONFIG_CONTENT ? 'set' : 'unset', attached, pgid: process.pid });
   const sid = argv.includes('-s') ? argv[argv.indexOf('-s') + 1] : 'ses_fake01';
   const emit = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+  if (env.FAKE_NOTERM === '1') process.on('SIGTERM', () => {});
+  if (env.FAKE_CHILD_PIDFILE) { const c = spawn('sleep', ['120'], { stdio: 'ignore' }); writeFileSync(env.FAKE_CHILD_PIDFILE, String(c.pid)); }
+  let failThis = true;
+  if (env.FAKE_FAIL_TIMES && env.FAKE_COUNT_FILE) { const n = existsSync(env.FAKE_COUNT_FILE) ? Number(readFileSync(env.FAKE_COUNT_FILE, 'utf8')) : 0; writeFileSync(env.FAKE_COUNT_FILE, String(n + 1)); failThis = n < Number(env.FAKE_FAIL_TIMES); }
   emit({ type: 'step_start', sessionID: sid, part: {} });
-  emit({ type: 'text', sessionID: sid, part: { text: 'hello ' } });
-  const done = () => { emit({ type: 'text', sessionID: sid, part: { text: 'world' } }); if (env.FAKE_EXIT && env.FAKE_EXIT !== '0') { process.stderr.write('fake failure\n'); process.exit(Number(env.FAKE_EXIT)); } process.exit(0); };
+  if (env.FAKE_STDERR_ONLY) { process.stderr.write(env.FAKE_STDERR_ONLY + '\n'); bye(Number(env.FAKE_EXIT || 1)); await new Promise(() => {}); }
+  if (env.FAKE_BIGOUT) { for (let i = 0; i < Number(env.FAKE_BIGOUT); i++) await wr(JSON.stringify({ type: 'text', sessionID: sid, part: { text: String.fromCharCode(66 + (i % 25)).repeat(1_000_000) } }) + '\n'); }
+  else if (env.FAKE_TEXT_FIRST === '1' || !(env.FAKE_ERR_MSG && failThis)) emit({ type: 'text', sessionID: sid, part: { text: 'hello ' } });
+  if (env.FAKE_ERR_MSG && failThis) {
+    emit({ type: 'error', timestamp: 1, sessionID: sid, error: { type: env.FAKE_ERR_TYPE || 'unknown', message: env.FAKE_ERR_MSG } });
+    if (env.FAKE_ERR_EXIT0 !== '1') bye(Number(env.FAKE_EXIT || 1));
+    else if (env.FAKE_TEXT_FIRST !== '1') bye(0);   // exit 0 with an error event and no output
+    if (env.FAKE_ERR_EXIT0 !== '1' || env.FAKE_TEXT_FIRST !== '1') await new Promise(() => {});
+  }
+  const done = () => { emit({ type: 'text', sessionID: sid, part: { text: 'world' } }); if (env.FAKE_EXIT && env.FAKE_EXIT !== '0') { process.stderr.write('fake failure\n'); bye(Number(env.FAKE_EXIT)); return; } bye(0); };
   if (env.FAKE_SLEEP) setTimeout(done, Number(env.FAKE_SLEEP) * 1000); else done();
 } else if (argv[0] !== 'api') fail('fake opencode: unsupported ' + argv.join(' '));

@@ -42,8 +42,8 @@ Then add a short section to your `CLAUDE.md` so Claude prefers the bridge: see [
 | Tool | Read-only | What it does |
 |---|---|---|
 | `opencode_start` | no | Delegate a job (async, returns a task id). Requires `tier`; enforces mode, agent allow-list, secret guard; titles the session. |
-| `opencode_status` / `opencode_result` | yes | State, elapsed time, session id, and the output (or its tail) of a task started by this bridge. |
-| `opencode_cancel` | no | Stop a task started by this bridge (never touches other sessions). |
+| `opencode_status` / `opencode_result` | yes | State, elapsed time, attempts, session id, and the output of a task started by this bridge. A failed task shows its **kind** (`rate_limit`, `quota`, `context_length`, ...), the message and advice. Output over 60000 characters is cut unless `head` / `tail` is given. |
+| `opencode_cancel` | no | Cancel a running or retrying task started by this bridge: SIGTERM then SIGKILL to its whole process group (never touches other sessions). |
 | `opencode_list` | yes | Tasks started by this bridge, with agent / tier / mode and title. |
 | `opencode_policy` | yes | The active routing mode for a directory, where it was detected, the allowed agents, tier rules, verification rules, roster. |
 | `opencode_sessions` | yes | **All** opencode sessions across projects: id, state, agent, age, tokens, directory, title. Filters: `state`, `agent`, `directory`, `search`, `title_prefix`, `since_minutes`, `limit`, `children`. |
@@ -97,6 +97,15 @@ The policy is the one in [docs/POLICY.md](docs/POLICY.md); in short:
 
 `<LANE>/<agent>: <task>`: LANE in capitals (a lane or repository short name), agent = the opencode agent, task = 3-8 words. Example: `DOCS/librarian: collect API notes`. `opencode_start` sets it from `lane` (default: upper-cased directory name) and the first line of the prompt, or from an explicit `title`. For a plain `opencode run` pass `--title`; an explicit title is kept (opencode's automatic title generator backs off from custom titles). `opencode_session_rename` fixes old ones; `opencode_sessions title_prefix="DOCS/"` lists one lane. Details: [docs/SESSION-NAMING.md](docs/SESSION-NAMING.md).
 
+## Limits, errors and recovery
+
+The bridge assumes things go wrong and says what to do about it ([docs/ERRORS.md](docs/ERRORS.md) has the full tables):
+
+- **Provider errors** (rate limit, quota, context length, output limit, overload, auth, bad model or agent, network) are parsed from opencode's error events and stderr, classified, and returned with advice. Only **transient** errors of **read-only** agents that produced **no output** are retried automatically (backoff 20 s, 60 s); an agent that edits files is never replayed.
+- **Runaway work**: at most 6 tasks at once, a 120 minute timeout per task, and cancel / timeout / disconnect kill the whole process group, including the shell commands the agent started.
+- **Size limits**: prompts over ~100 KB are attached as a file (Linux limits one argument to 128 KiB); replies are capped at 100000 characters; output is kept up to 2 MB per task.
+- **Service problems**: a stopped, hung or unauthorised opencode service, or a huge reply, produces a one-line message, not a stack trace; long scans stop at a deadline and say `PARTIAL`.
+
 ## Configuration
 
 | Variable | Meaning |
@@ -106,6 +115,10 @@ The policy is the one in [docs/POLICY.md](docs/POLICY.md); in short:
 | `OPENCODE_BRIDGE_AGENT` | Default agent when `agent` is omitted (blueprint / insensitive). Default `worker`. In sensitive mode the default is always `explorer`. |
 | `OPENCODE_BRIDGE_MODE`, `OPENCODE_MODE` | Force a routing mode (`blueprint` / `sensitive` / `insensitive`). |
 | `CLAUDE_CONFIG_DIR` | Also searched for an `insensitive` marker file. |
+| `OPENCODE_BRIDGE_MAX_PARALLEL` | Concurrent delegated tasks, default 6 (1-64). |
+| `OPENCODE_BRIDGE_TIMEOUT_MIN` | Default per-task timeout in minutes, default 120 (`timeout_minutes` overrides per task). |
+| `OPENCODE_BRIDGE_RETRIES`, `OPENCODE_BRIDGE_RETRY_DELAY_S` | Automatic retries (default 2) and the first delay (default 20 s, then x3). |
+| `OPENCODE_BRIDGE_API_TIMEOUT_MS`, `OPENCODE_BRIDGE_SCAN_DEADLINE_MS`, `OPENCODE_BRIDGE_KILL_GRACE_MS` | Service call timeout (45000), session-scan deadline (35000), SIGTERM to SIGKILL grace (5000). |
 
 ## How it works
 
@@ -114,16 +127,16 @@ All session reads go through `opencode api GET /api/session...`, which talks to 
 ## Tests
 
 ```bash
-npm test                 # 115 offline tests: fake opencode, no network, no tokens
-npm run test:live        # 5 live tests against your real opencode service (spends a few thousand tokens, cleans up after itself)
+npm test                 # 190 offline tests: fake opencode, no network, no tokens
+npm run test:live        # 7 live tests against your real opencode service (spends a few thousand tokens, cleans up after itself)
 ```
 
-The offline suite covers the MCP protocol, every tool and every parameter, pagination across pages, state / stale detection, output rendering and truncation, rename, the process table (against a compiled stand-in binary named `opencode`), mode detection from every source and their precedence, tier and agent enforcement per mode, the secret guard, and error paths. See [docs/TESTING.md](docs/TESTING.md).
+The offline suite covers the MCP protocol, every tool and every parameter, pagination across pages, state / stale detection, output rendering and truncation, rename, the process table (against a compiled stand-in binary named `opencode`), mode detection from every source and their precedence, tier and agent enforcement per mode, the secret guard, and every error path: provider errors and their classification, the retry rules, timeouts and process-group kills, the parallel limit, oversized prompts, service failures, shutdown. See [docs/TESTING.md](docs/TESTING.md).
 
 ## Limitations
 
 - opencode **v2** only (`/api/...` routes). The older `opencode serve` HTTP API with `/session` is not supported.
-- The bridge runs one `opencode run --standalone` process per task; it does not keep a long-lived opencode server of its own.
+- The bridge runs one `opencode run --standalone` process per task; it does not keep a long-lived opencode server of its own. Task state is in memory: after a restart of the bridge the opencode sessions remain readable, but the tasks are no longer listed.
 - `tier` and `mode` are enforced mechanically, but whether a task is really "easy" is still Claude's judgement. The policy cannot read the task.
 - Session output can contain whatever the agent saw, including file contents. The tools are read-only but the text goes to the model.
 
