@@ -23,9 +23,9 @@ describe('MCP protocol', () => {
   test('initialize without a protocolVersion falls back to a default', async () => {
     assert.equal((await s.rpc('initialize', {})).result.protocolVersion, '2024-11-05');
   });
-  test('tools/list: the ten tools, each with a valid object schema', async () => {
+  test('tools/list: the eleven tools, each with a valid object schema', async () => {
     const { tools } = (await s.rpc('tools/list')).result;
-    assert.deepEqual(tools.map((t) => t.name).sort(), ['opencode_cancel', 'opencode_list', 'opencode_policy', 'opencode_processes', 'opencode_result', 'opencode_session_output', 'opencode_session_rename', 'opencode_sessions', 'opencode_start', 'opencode_status']);
+    assert.deepEqual(tools.map((t) => t.name).sort(), ['opencode_cancel', 'opencode_list', 'opencode_policy', 'opencode_processes', 'opencode_result', 'opencode_resume', 'opencode_session_output', 'opencode_session_rename', 'opencode_sessions', 'opencode_start', 'opencode_status']);
     for (const t of tools) {
       assert.ok(t.description.length > 20, `${t.name} description`);
       assert.equal(t.inputSchema.type, 'object');
@@ -124,7 +124,7 @@ describe('own tasks: start / status / result / cancel / list', () => {
     try {
       const id = (await s2.text('opencode_start', { tier: 'easy', prompt: 'p' })).match(/task (\w+)/)[1];
       await waitFor(async () => (await s2.text('opencode_result', { id })).includes('hello'));
-      assert.match(await s2.text('opencode_result', { id }), /^\[running\]\nhello $/);
+      assert.match(await s2.text('opencode_result', { id }), /^\[running\]\nprogress: [^\n]*\nhello $/);
       assert.equal(await s2.text('opencode_cancel', { id }), 'cancelled');
       await waitFor(async () => /^cancelled/.test(await s2.text('opencode_status', { id })));
     } finally { s2.close(); }

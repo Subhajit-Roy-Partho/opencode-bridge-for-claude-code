@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::path::Path;
 use std::sync::OnceLock;
 
-pub const VERSION: &str = "0.5.0";
+pub const VERSION: &str = "0.6.0";
 pub const MAX_TEXT: usize = 2_000_000;
 pub const ARG_LIMIT: usize = 100_000;
 pub const PROMPT_MAX: usize = 5_000_000;
@@ -13,10 +13,13 @@ pub const RESULT_CAP: usize = 60_000;
 pub const RESPONSE_CAP: usize = 100_000;
 pub const KEEP_FINISHED: usize = 200;
 pub const WORKER_CONFIG: &str = r#"{"agent":{"worker":{"mode":"primary","description":"Direct implementer: does the work itself, never delegates","prompt":"You are a direct implementer. Do all work yourself with your own file and shell tools. Never launch sub-agents or tasks. Do not end your turn until the work is finished and verified.","permission":{"task":"deny"}}}}"#;
+pub const INTERRUPTED_ADVICE: &str = "The run was stopped before it reported an outcome (the client or the opencode service was stopped or restarted, the machine slept, or someone interrupted the session). It is not a provider failure. Partial work is in the session history (opencode_session_output). Read-only agents: opencode_resume continues it; editing agents: check `git status` first (opencode_resume shows it and needs acknowledge_edits).";
 
 pub struct Config {
     pub model: String,
     pub root: String,
+    pub backend: String,
+    pub kill_on_exit: bool,
     pub max_parallel: usize,
     pub default_timeout_min: f64,
     pub max_retries: u32,
@@ -25,6 +28,13 @@ pub struct Config {
     pub scan_deadline_ms: u64,
     pub kill_grace_ms: u64,
     pub timeout_unit_ms: u64,
+    pub keep_days_ms: i64,
+    pub max_wait_s: f64,
+    pub call_budget_ms: u64,
+    pub progress_ms: u64,
+    pub wait_poll_ms: u64,
+    pub reattach_poll_ms: u64,
+    pub reattach_quiet_ms: i64,
     pub procfs: bool,
 }
 
@@ -34,19 +44,41 @@ pub fn cfg() -> &'static Config {
         let root_raw = std::env::var("OPENCODE_BRIDGE_ROOT").ok().filter(|s| !s.is_empty())
             .unwrap_or_else(|| std::env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| "/".into()));
         let root = std::fs::canonicalize(&root_raw).map(|p| p.to_string_lossy().to_string()).unwrap_or(root_raw);
+        let backend = std::env::var("OPENCODE_BRIDGE_BACKEND").unwrap_or_default();
+        let backend = if ["auto", "service", "standalone"].contains(&backend.as_str()) { backend } else { "auto".into() };
         Config {
             model: std::env::var("OPENCODE_BRIDGE_MODEL").unwrap_or_default(),
             root,
+            backend,
+            kill_on_exit: std::env::var("OPENCODE_BRIDGE_KILL_ON_EXIT").map(|v| v == "1").unwrap_or(false),
             max_parallel: num_env("OPENCODE_BRIDGE_MAX_PARALLEL", 6.0, 1.0, 64.0) as usize,
             default_timeout_min: num_env("OPENCODE_BRIDGE_TIMEOUT_MIN", 120.0, 1.0, 1440.0),
             max_retries: num_env("OPENCODE_BRIDGE_RETRIES", 2.0, 0.0, 5.0) as u32,
             retry_delay_ms: (num_env("OPENCODE_BRIDGE_RETRY_DELAY_S", 20.0, 0.0, 600.0) * 1000.0) as u64,
-            api_timeout_ms: num_env("OPENCODE_BRIDGE_API_TIMEOUT_MS", 45000.0, 200.0, 600000.0) as u64,
-            scan_deadline_ms: num_env("OPENCODE_BRIDGE_SCAN_DEADLINE_MS", 35000.0, 200.0, 600000.0) as u64,
+            api_timeout_ms: num_env("OPENCODE_BRIDGE_API_TIMEOUT_MS", 20000.0, 200.0, 600000.0) as u64,
+            scan_deadline_ms: num_env("OPENCODE_BRIDGE_SCAN_DEADLINE_MS", 20000.0, 200.0, 600000.0) as u64,
             kill_grace_ms: num_env("OPENCODE_BRIDGE_KILL_GRACE_MS", 5000.0, 50.0, 60000.0) as u64,
             timeout_unit_ms: num_env("OPENCODE_BRIDGE_TIMEOUT_UNIT_MS", 60000.0, 10.0, 60000.0) as u64,
+            keep_days_ms: (num_env("OPENCODE_BRIDGE_KEEP_DAYS", 14.0, 1.0, 365.0) * 86400000.0) as i64,
+            max_wait_s: num_env("OPENCODE_BRIDGE_MAX_WAIT_S", 25.0, 1.0, 55.0),
+            call_budget_ms: (num_env("OPENCODE_BRIDGE_CALL_BUDGET_S", 28.0, 0.2, 120.0) * 1000.0) as u64,
+            progress_ms: num_env("OPENCODE_BRIDGE_PROGRESS_MS", 4000.0, 50.0, 60000.0) as u64,
+            wait_poll_ms: num_env("OPENCODE_BRIDGE_WAIT_POLL_MS", 300.0, 10.0, 5000.0) as u64,
+            reattach_poll_ms: num_env("OPENCODE_BRIDGE_REATTACH_POLL_MS", 3000.0, 20.0, 60000.0) as u64,
+            reattach_quiet_ms: (num_env("OPENCODE_BRIDGE_REATTACH_QUIET_S", 90.0, 0.05, 3600.0) * 1000.0) as i64,
             procfs: std::env::var("OPENCODE_BRIDGE_PROCFS").map(|v| v != "0").unwrap_or(true) && Path::new("/proc/self/cmdline").exists(),
         }
+    })
+}
+
+/// Directory holding task state (docs/STATE.md): $OPENCODE_BRIDGE_STATE_DIR, else $XDG_STATE_HOME/opencode-bridge, else ~/.local/state/opencode-bridge.
+pub fn state_dir() -> &'static str {
+    static S: OnceLock<String> = OnceLock::new();
+    S.get_or_init(|| {
+        if let Ok(d) = std::env::var("OPENCODE_BRIDGE_STATE_DIR") { if !d.is_empty() { return d; } }
+        if let Ok(x) = std::env::var("XDG_STATE_HOME") { if !x.is_empty() { return format!("{}/opencode-bridge", x); } }
+        let home = std::env::var("HOME").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/root".into());
+        format!("{}/.local/state/opencode-bridge", home)
     })
 }
 

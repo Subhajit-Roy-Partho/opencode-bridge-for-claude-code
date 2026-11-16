@@ -1,13 +1,15 @@
 # Rust implementation
 
-`rust/` is a port of `server.mjs` to Rust. **The Node original is kept and remains the reference**; both implementations expose the same ten tools, say the same things, and pass the same test suite.
+`rust/` is a port of `server.mjs` to Rust. **The Node original is kept and remains the reference**; both implementations expose the same eleven tools, say the same things, and pass the same test suite.
 
 | | Node (`server.mjs`) | Rust (`rust/`) |
 |---|---|---|
 | start to `initialize` reply (median of 15) | 35 ms | **7 ms** |
 | resident memory of an idle server | 55 MB | **6 MB** |
 | binary / runtime | needs Node 18+ | one 2.3 MB static-ish binary (glibc), no runtime |
-| tests | 190 offline + 7 live | the **same** 190 offline + 7 live |
+| tests | 227 offline + 7 live | the **same** 227 offline + 7 live |
+
+Tasks are persistent and detached (v0.6, see `docs/STATE.md`): `opencode_start` writes a task directory under the state directory (`$OPENCODE_BRIDGE_STATE_DIR`, else `$XDG_STATE_HOME/opencode-bridge`, else `~/.local/state/opencode-bridge`) and spawns a detached runner (`opencode-bridge --runner <task dir>`, one per task) that owns the run — the same files the Node runner writes, so a task started by one implementation can be read by the other.
 
 (Measured on Linux x86-64, Node 24, release build with LTO. Each Claude Code session starts its own bridge process, so the memory difference multiplies with the number of sessions.)
 
@@ -47,10 +49,13 @@ claude mcp add --scope user opencode-bridge \
 
 | file | role |
 |---|---|
-| `src/main.rs` | JSON-RPC loop, dispatch, response cap, signals and shutdown |
-| `src/config.rs` | environment limits, embedded texts, error classification |
+| `src/main.rs` | JSON-RPC loop, dispatch, response cap, wait budget, progress, signals and shutdown; `--runner` dispatch |
+| `src/config.rs` | environment limits, state directory, embedded texts, error classification |
+| `src/state.rs` | persistent task state (docs/STATE.md): atomic writes, process references, event parsing |
+| `src/runner.rs` | detached supervisor of one task: deadline, cancel, re-attach, step-limit fallback, retry |
+| `src/svc.rs` | shared service-session helpers (sessionState, reattach, active ids) |
 | `src/policy.rs` | routing-mode detection, tier / agent / secret enforcement, `opencode_policy` |
-| `src/tasks.rs` | start / status / result / cancel / list: process groups, events, retry, timeout |
+| `src/tasks.rs` | start / status / result / cancel / resume / list: snapshots, reconcile, bounded waits |
 | `src/api.rs` | `opencode api` calls: timeout, 64 MB cap, error mapping, one retry of reads |
 | `src/sessions.rs` | session list, output rendering, rename |
 | `src/procs.rs` | process table |

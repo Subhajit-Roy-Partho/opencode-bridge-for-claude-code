@@ -10,8 +10,12 @@
 //        FAKE_TEXT_FIRST=1 emit text before the error;  FAKE_ERR_EXIT0=1 exit 0 despite the error event;  FAKE_FAIL_TIMES=<n> + FAKE_COUNT_FILE=<f>: only the first n runs fail
 //        FAKE_NOTERM=1 ignore SIGTERM;  FAKE_CHILD_PIDFILE=<f> start a child `sleep` in the same process group and write its pid
 //        FAKE_BIGOUT=<MB> emit that many MB of text;  FAKE_STDERR_ONLY=<msg> fail with that stderr line and no events
+//   FAKE_SVC=<dir>    simulate the opencode SERVICE for non-standalone runs: the session lives in <dir>/<sid>.json and keeps running (and finishes) when the
+//                     client is SIGKILLed; SIGTERM / POST .../interrupt make it `interrupted`. FAKE_SLEEP = how long the job takes; FAKE_SVC_OUTCOME (succeeded|failed|interrupted)
+//                     is how it ends; FAKE_SVC_TEXT the final answer. API: GET /api/session/<sid> (+ /message, /active), POST /api/session/<sid>/interrupt.
 //   api: FAKE_API_ECONN=1 / FAKE_API_401=1 / FAKE_API_SLEEP=<ms> / FAKE_API_FLAKY=<file> (first call fails with ECONNRESET)
-import { appendFileSync, readFileSync, writeFileSync, existsSync, statSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync, existsSync, statSync, mkdirSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 const argv = process.argv.slice(2);
 const env = process.env;
@@ -70,6 +74,23 @@ function messages(i) { // chronological
   return [mk(1, { type: 'user', text: `prompt ${i}` }), mk(2, { type: 'assistant', agent: AGENTS[i % 7], content: [{ type: 'text', text: `answer ${i}` }] }), mk(3, { type: 'idle', outcome: 'succeeded' })];
 }
 
+// ---- simulated service sessions (FAKE_SVC) ----
+const svcFile = (id) => join(env.FAKE_SVC, id + '.json');
+function svcRec(id) {
+  if (!env.FAKE_SVC || !/^ses_svc/.test(id) || !existsSync(svcFile(id))) return null;
+  const r = JSON.parse(readFileSync(svcFile(id), 'utf8'));
+  if (!r.outcome && Date.now() >= r.finishAt) { r.outcome = r.finalOutcome; r.updated = Date.now(); writeFileSync(svcFile(id), JSON.stringify(r)); }
+  return r;
+}
+const svcRunning = (r) => r && !r.outcome;
+const svcSession = (r) => ({ id: r.id, projectID: 'p', agent: r.agent, model: { id: 'muse', providerID: 'opencode-go' }, cost: 0, tokens: { input: 100, output: 10, reasoning: 0, cache: { read: 0, write: 0 } }, time: { created: r.created, updated: r.updated }, location: { directory: r.directory }, title: r.title, ...(r.outcome ? { outcome: r.outcome } : {}) });
+function svcMessages(r) { // newest first
+  const m = [{ id: 'msg_1', type: 'user', time: { created: r.created }, text: 'go' }];
+  if (r.outcome === 'succeeded') m.push({ id: 'msg_2', type: 'assistant', agent: r.agent, time: { created: r.created + 1 }, content: [{ type: 'text', text: r.text }] }, { id: 'msg_3', type: 'idle', outcome: 'succeeded', time: { created: r.created + 2 } });
+  else if (r.outcome) m.push({ id: 'msg_2', type: 'assistant', agent: r.agent, time: { created: r.created + 1 }, content: [{ type: 'text', text: 'hello ' }] }, { id: 'msg_3', type: 'idle', outcome: r.outcome, time: { created: r.created + 2 }, ...(r.outcome === 'failed' ? { error: { type: 'provider.rate-limit', message: '429 Too Many Requests' } } : {}) });
+  return m.reverse();
+}
+
 function out(o) { process.stdout.write(JSON.stringify(o)); }
 const wr = (s) => new Promise((r) => process.stdout.write(s, r));   // awaited write: a pipe must be drained before the process exits
 const bye = (n) => process.stdout.write('', () => process.exit(n));
@@ -88,10 +109,21 @@ if (argv[0] === 'api') {
   const p = url.pathname, q = url.searchParams;
   if (method === 'GET' && p === '/api/session/active') {
     if (env.FAKE_ACTIVE_FAIL === '1') fail('active failed');
-    out({ data: { ses_000: { status: 'busy' }, ses_003: { status: 'busy' } } }); process.exit(0);
+    const act = { ses_000: { status: 'busy' }, ses_003: { status: 'busy' } };
+    if (env.FAKE_SVC && existsSync(env.FAKE_SVC)) for (const f of readdirSync(env.FAKE_SVC)) { if (!f.endsWith('.json')) continue; const r = svcRec(f.slice(0, -5)); if (svcRunning(r)) act[r.id] = { type: 'running' }; }
+    out({ data: act }); process.exit(0);
   }
+  { const sm = /^\/api\/session\/(ses_svc[^/]*)(\/message|\/interrupt)?$/.exec(p);
+    if (sm) {
+      const r = svcRec(sm[1]); if (!r) fail('HTTP 404 Not Found');
+      if (sm[2] === '/interrupt' && method === 'POST') { const was = svcRunning(r); if (was) { r.outcome = 'interrupted'; r.updated = Date.now(); writeFileSync(svcFile(r.id), JSON.stringify(r)); } out({ interrupted: was }); process.exit(0); }
+      if (sm[2] === '/message' && method === 'GET') { out({ data: svcMessages(r).slice(0, Number(q.get('limit') || 50)), cursor: { previous: null, next: null } }); process.exit(0); }
+      if (!sm[2] && method === 'GET') { out({ data: svcSession(r) }); process.exit(0); }
+    }
+    if (method === 'POST' && /^\/api\/session\/[^/]+\/interrupt$/.test(p)) { if (idx(p.split('/')[3]) >= 0) { out({ interrupted: false }); process.exit(0); } fail('HTTP 404 Not Found'); } }
   if (method === 'GET' && p === '/api/session') {
     let all = ids().map(session);
+    if (env.FAKE_SVC && existsSync(env.FAKE_SVC)) { const sv = readdirSync(env.FAKE_SVC).filter((f) => f.endsWith('.json')).map((f) => svcRec(f.slice(0, -5))).filter(Boolean).sort((a, b) => b.created - a.created).map(svcSession); all = [...sv, ...all]; }
     if (q.get('archived') === 'true') all = [];
     if (q.get('search')) all = all.filter((s) => s.title.toLowerCase().includes(q.get('search').toLowerCase()));
     if (q.get('directory')) all = all.filter((s) => s.location.directory === q.get('directory'));
@@ -118,8 +150,25 @@ if (argv[0] === 'run') {
   const fi = argv.indexOf('-f'); let attached;
   if (fi >= 0) { const f = argv[fi + 1]; attached = { path: f, bytes: statSync(f).size, mode: (statSync(f).mode & 0o777).toString(8), head: readFileSync(f, 'utf8').slice(0, 40) }; }
   log({ argv, cwd: process.cwd(), pwd: env.PWD, config: env.OPENCODE_CONFIG_CONTENT ? 'set' : 'unset', attached, pgid: process.pid });
-  const sid = argv.includes('-s') ? argv[argv.indexOf('-s') + 1] : 'ses_fake01';
+  let sid = argv.includes('-s') ? argv[argv.indexOf('-s') + 1] : 'ses_fake01';
   const emit = (o) => process.stdout.write(JSON.stringify(o) + '\n');
+  if (env.FAKE_SVC && !argv.includes('--standalone')) { // a run through the (simulated) service: the session outlives its client
+    mkdirSync(env.FAKE_SVC, { recursive: true });
+    if (!argv.includes('-s')) sid = `ses_svc${Date.now().toString(36)}${process.pid}`;
+    const file = svcFile(sid); const old = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : null;
+    const rec = { id: sid, created: old?.created ?? now, updated: Date.now(), agent: argv[argv.indexOf('--agent') + 1], title: argv.includes('--title') ? argv[argv.indexOf('--title') + 1] : old?.title, directory: process.cwd(),
+      finishAt: Date.now() + Number(env.FAKE_SLEEP || 0) * 1000, outcome: null, finalOutcome: env.FAKE_SVC_OUTCOME || 'succeeded', text: env.FAKE_SVC_TEXT || 'hello world', clientPid: process.pid };
+    writeFileSync(file, JSON.stringify(rec));
+    process.on('SIGTERM', () => { const r = JSON.parse(readFileSync(file, 'utf8')); if (!r.outcome) { r.outcome = 'interrupted'; r.updated = Date.now(); writeFileSync(file, JSON.stringify(r)); } emit({ type: 'error', timestamp: 1, sessionID: sid, error: { type: 'aborted', message: 'Session interrupted: user' } }); bye(1); });
+    emit({ type: 'step_start', sessionID: sid, part: {} }); emit({ type: 'text', sessionID: sid, part: { text: 'hello ' } });
+    emit({ type: 'tool_use', timestamp: Date.now(), sessionID: sid, part: { type: 'tool', tool: 'read', state: { status: 'completed', input: { path: 'docs/' } } } });
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 80)); const r = svcRec(sid);
+      if (r.outcome === 'interrupted') { emit({ type: 'error', timestamp: 1, sessionID: sid, error: { type: 'aborted', message: 'Session interrupted: user' } }); bye(1); await new Promise(() => {}); }
+      if (r.outcome === 'failed') { emit({ type: 'error', timestamp: 1, sessionID: sid, error: { type: 'provider.rate-limit', message: '429 Too Many Requests' } }); bye(1); await new Promise(() => {}); }
+      if (r.outcome) { emit({ type: 'text', sessionID: sid, part: { text: 'world' } }); bye(0); await new Promise(() => {}); }
+    }
+  }
   if (env.FAKE_NOTERM === '1') process.on('SIGTERM', () => {});
   if (env.FAKE_CHILD_PIDFILE) { const c = spawn('sleep', ['120'], { stdio: 'ignore' }); writeFileSync(env.FAKE_CHILD_PIDFILE, String(c.pid)); }
   let failThis = true;

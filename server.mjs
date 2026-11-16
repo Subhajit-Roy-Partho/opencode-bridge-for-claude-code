@@ -19,11 +19,12 @@
 import { spawn, execFile, execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { randomBytes } from 'node:crypto';
-import { realpathSync, readFileSync, existsSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { realpathSync, readFileSync, existsSync, mkdtempSync, writeFileSync, rmSync, mkdirSync, renameSync, openSync, closeSync, readSync, fstatSync, readdirSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.5.0';
+const VERSION = '0.6.0';
 // Model for delegated runs (provider/model[#variant]). Unset = no -m flag, i.e. opencode's own default model.
 const DEFAULT_MODEL = process.env.OPENCODE_BRIDGE_MODEL || '';
 // Workers may only operate inside this root (set per-registration).
@@ -38,7 +39,6 @@ const GUARD_TAIL = 'work only inside the current directory; never run git commit
 const GUARD = 'Rules: do the work yourself, never delegate to other agents, do not stop until finished; ' + GUARD_TAIL;
 const GUARD_LANES = 'Rules: you may use your own explorer/librarian sub-lanes for missing context (one level, never deeper), do not stop until finished; ' + GUARD_TAIL; // general / deep-research
 const guardFor = (agent) => (['general', 'deep-research'].includes(agent) ? GUARD_LANES : GUARD);
-const tasks = new Map();
 const STALE_MIN = 45; // a session with no outcome and no update for this long is reported as "stale?" (crashed / killed / hung)
 
 // ---------- limits and robustness (v0.4) ----------
@@ -47,8 +47,8 @@ const MAX_PARALLEL = num(process.env.OPENCODE_BRIDGE_MAX_PARALLEL, 6, 1, 64);   
 const DEFAULT_TIMEOUT_MIN = num(process.env.OPENCODE_BRIDGE_TIMEOUT_MIN, 120, 1, 1440);  // per-task wall clock
 const MAX_RETRIES = num(process.env.OPENCODE_BRIDGE_RETRIES, 2, 0, 5);                   // automatic retries: read-only agents, transient errors only
 const RETRY_DELAY_MS = num(process.env.OPENCODE_BRIDGE_RETRY_DELAY_S, 20, 0, 600) * 1000; // first delay; x3 for the next
-const API_TIMEOUT_MS = num(process.env.OPENCODE_BRIDGE_API_TIMEOUT_MS, 45000, 200, 600000);
-const SCAN_DEADLINE_MS = num(process.env.OPENCODE_BRIDGE_SCAN_DEADLINE_MS, 35000, 200, 600000);
+const API_TIMEOUT_MS = num(process.env.OPENCODE_BRIDGE_API_TIMEOUT_MS, 20000, 200, 600000);
+const SCAN_DEADLINE_MS = num(process.env.OPENCODE_BRIDGE_SCAN_DEADLINE_MS, 20000, 200, 600000);
 const KILL_GRACE_MS = num(process.env.OPENCODE_BRIDGE_KILL_GRACE_MS, 5000, 50, 60000);   // SIGTERM -> SIGKILL
 const MAX_TEXT = 2_000_000;      // output kept per task (the last 2 MB)
 const ARG_LIMIT = 100_000;       // bytes; Linux allows ~128 KiB per single argument, larger prompts are attached as a file
@@ -57,7 +57,20 @@ const RESULT_CAP = 60_000;       // default size of opencode_result (Claude Code
 const RESPONSE_CAP = 100_000;    // hard cap of any tool reply
 const PROCFS = process.env.OPENCODE_BRIDGE_PROCFS !== '0' && existsSync('/proc/self/cmdline'); // OPENCODE_BRIDGE_PROCFS=0 forces the ps fallback (tests)
 const TIMEOUT_UNIT_MS = num(process.env.OPENCODE_BRIDGE_TIMEOUT_UNIT_MS, 60000, 10, 60000); // one "minute" of timeout_minutes (tests shorten it)
-const KEEP_FINISHED = 200;       // finished tasks kept in memory
+const KEEP_FINISHED = 200;       // finished tasks kept on disk (older ones are pruned at start-up)
+// v0.6: persistence, bounded waits, re-attach
+const STATE_DIR = process.env.OPENCODE_BRIDGE_STATE_DIR || join(process.env.XDG_STATE_HOME || join(process.env.HOME || homedir(), '.local', 'state'), 'opencode-bridge'); // task registry, see docs/STATE.md
+const KEEP_DAYS = num(process.env.OPENCODE_BRIDGE_KEEP_DAYS, 14, 1, 365);                  // finished task directories older than this are pruned
+const MAX_WAIT_S = num(process.env.OPENCODE_BRIDGE_MAX_WAIT_S, 25, 1, 55);               // longest wait of opencode_status / opencode_result / opencode_start (wait_s)
+const CALL_BUDGET_MS = num(process.env.OPENCODE_BRIDGE_CALL_BUDGET_S, 28, 0.2, 120) * 1000; // no tool call blocks longer than this
+const PROGRESS_MS = num(process.env.OPENCODE_BRIDGE_PROGRESS_MS, 4000, 50, 60000);        // MCP progress notification interval for calls that pass a progressToken
+const WAIT_POLL_MS = num(process.env.OPENCODE_BRIDGE_WAIT_POLL_MS, 300, 10, 5000);
+const REATTACH_POLL_MS = num(process.env.OPENCODE_BRIDGE_REATTACH_POLL_MS, 3000, 20, 60000); // runner: polling of a service session whose client died
+const REATTACH_QUIET_MS = num(process.env.OPENCODE_BRIDGE_REATTACH_QUIET_S, 90, 0.05, 3600) * 1000; // a session the service does not run and that was quiet this long is "interrupted"
+const BACKEND = ['auto', 'service', 'standalone'].includes(process.env.OPENCODE_BRIDGE_BACKEND) ? process.env.OPENCODE_BRIDGE_BACKEND : 'auto'; // auto: worker -> private instance, roster agents -> the service
+const KILL_ON_EXIT = process.env.OPENCODE_BRIDGE_KILL_ON_EXIT === '1';                     // legacy: cancel this instance's tasks when the bridge exits
+const SELF = fileURLToPath(import.meta.url);
+const RUNNER_CMD = [process.execPath, SELF];
 
 // Error classes: [kind, transient (worth retrying), pattern, advice]. Applied to opencode error events / stderr, never to model text.
 const KINDS = [
@@ -69,6 +82,7 @@ const KINDS = [
   ['auth', false, /\b(401|403)\b|unauthori[sz]ed|forbidden|invalid[ _-]?api[ _-]?key|authentication|not logged in|credentials? (expired|invalid)/i, 'Authentication problem. Not retried. Check the provider login or key (`opencode auth login`).'],
   ['agent', false, /agent not found/i, 'Agent not found. Install the roster from the opencode-config repository, or use agent "worker".'],
   ['model', false, /provider\.no-route|model (is )?(unavailable|not found)|unknown model|no such model/i, 'Model unavailable. Check OPENCODE_BRIDGE_MODEL / the `model` argument (`opencode models` lists valid ids).'],
+  ['step_limit', false, /tool_choice/i, 'The provider rejected a forced `tool_choice`. This is what happens when an agent reaches its `steps` limit: opencode then forces a final answer, and a provider that only accepts "auto" fails the request (docs/ERRORS.md). Read-only agents are asked automatically, once, to write their report in the same session; otherwise use opencode_resume, or remove / raise `steps` of that agent in opencode.jsonc.'],
   ['invalid_request', false, /provider\.invalid-request|invalid[ _-]request|bad request|\b400\b/i, 'The provider rejected the request (often an agent or tool setting the model does not support). Not retried; try another model or agent.'],
   ['network', true, /ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|EPIPE|socket hang up|fetch failed|network|connection (reset|closed|refused|error)|timed? ?out/i, 'Network problem talking to the provider (transient). Read-only agents are retried automatically; otherwise check connectivity and retry.'],
 ];
@@ -139,14 +153,15 @@ const INSTRUCTIONS = [
   'opencode-bridge: delegate easy/medium work to opencode (cheap model) and watch every opencode session. Routing policy is enforced by the tools, not optional.',
   'MODES (call opencode_policy to see which is active for a directory; SENSITIVE wins): ' + Object.values(MODE_RULES).join(' | '),
   'TIERS: ' + TIER_RULE,
-  'WORKFLOW: opencode_start needs tier (easy|medium) and agent (' + Object.keys(ROSTER).join('|') + '); then poll opencode_status / opencode_result; see all sessions with opencode_sessions (state=running for what is active now) and read one with opencode_session_output. ' + VERIFY_RULE,
-  'LIMITS AND ERRORS: at most OPENCODE_BRIDGE_MAX_PARALLEL tasks run at once (default 6) and each has a timeout (default 120 min, process group killed). Failures are classified in opencode_result (rate_limit, quota, context_length, output_limit, overloaded, auth, model, agent, invalid_request, network, timeout, spawn, exit) with advice. Only TRANSIENT errors (rate_limit, overloaded, network) of READ-ONLY agents that produced no output are retried automatically with backoff; an editing agent is never replayed. quota / auth / context_length / invalid_request are not retried: switch model, split the task, or keep the work on Claude. Prompts over ~100 KB are attached as a file.',
+  'WORKFLOW: opencode_start needs tier (easy|medium) and agent (' + Object.keys(ROSTER).join('|') + '); then poll opencode_status / opencode_result with wait_s (a bounded wait, at most 25 s per call; a long job answers still_running with its progress, poll again); see all sessions with opencode_sessions (state=running for what is active now) and read one with opencode_session_output. ' + VERIFY_RULE,
+  'LIMITS AND ERRORS: at most OPENCODE_BRIDGE_MAX_PARALLEL tasks run at once (default 6) and each has a timeout (default 120 min, process group killed). Failures are classified in opencode_result (rate_limit, quota, context_length, output_limit, overloaded, auth, model, agent, step_limit, invalid_request, network, timeout, spawn, exit) with advice; interrupted and lost are separate outcomes, not failures. Only TRANSIENT errors (rate_limit, overloaded, network) of READ-ONLY agents that produced no output are retried automatically with backoff; an editing agent is never replayed. quota / auth / context_length / invalid_request are not retried: switch model, split the task, or keep the work on Claude. Prompts over ~100 KB are attached as a file.',
+  'RESTARTS AND TIMEOUTS: tasks run detached and are stored in a state directory, so they survive a restart of this bridge or of Claude Code; after a restart opencode_list / opencode_status / opencode_result still work for them. No call blocks longer than ~28 s (wait_s is capped at 25 s). A task that ended as interrupted (client or service stopped) can be continued with opencode_resume (read-only agents directly; editing agents only with acknowledge_edits after you looked at git status). opencode_cancel also accepts a session id and cancels it through the opencode service.',
   'NAMING: every session title is "<LANE>/<agent>: <task>" (e.g. ALPHA/deep-research: collect API notes); opencode_start sets it, opencode_session_rename fixes old ones. The agent roster (explorer, librarian, deep-research, oracle, fixer, designer, general) comes from the opencode-config repository (https://github.com/Subhajit-Roy-Partho/opencode-config/tree/v2); without it only the built-in "worker" agent exists.',
 ].join('\n\n');
 
 const S = { type: 'string' }, N = { type: 'number' }, B = { type: 'boolean' };
 const tools = [
-  { name: 'opencode_start', description: 'Delegate an EASY or MEDIUM job to an opencode agent (async; returns a task id). POLICY IS ENFORCED: `tier` is required and hard/unsure work is refused (it stays on Claude); the routing MODE (blueprint default | sensitive | insensitive; sensitive wins) is detected from env OPENCODE_MODE, <project>/.claude/sensitive|insensitive, ~/.claude/insensitive, or the `mode` argument, and limits the agents (sensitive: explorer, librarian, deep-research, oracle, and fixer/worker only with mechanical:true). Blueprint mode: give fixer/designer a written Blueprint (files, signatures, edge cases, acceptance criteria, test command). Prompts containing secrets are refused. The session is titled "<LANE>/<agent>: <task>". LIMITS: at most OPENCODE_BRIDGE_MAX_PARALLEL tasks at once (default 6), a per-task timeout, automatic retry (backoff) of transient provider errors for read-only agents only, prompts over ~100 KB are sent as an attached file. Verify the result yourself - it is an untrusted draft. Call opencode_policy for the full rules.',
+  { name: 'opencode_start', description: 'Delegate an EASY or MEDIUM job to an opencode agent (async; returns a task id). POLICY IS ENFORCED: `tier` is required and hard/unsure work is refused (it stays on Claude); the routing MODE (blueprint default | sensitive | insensitive; sensitive wins) is detected from env OPENCODE_MODE, <project>/.claude/sensitive|insensitive, ~/.claude/insensitive, or the `mode` argument, and limits the agents (sensitive: explorer, librarian, deep-research, oracle, and fixer/worker only with mechanical:true). Blueprint mode: give fixer/designer a written Blueprint (files, signatures, edge cases, acceptance criteria, test command). Prompts containing secrets are refused. The session is titled "<LANE>/<agent>: <task>". The task runs DETACHED and is stored on disk: it survives a restart of this bridge or of Claude Code. LIMITS: at most OPENCODE_BRIDGE_MAX_PARALLEL tasks at once (default 6), a per-task timeout, automatic retry (backoff) of transient provider errors for read-only agents only, prompts over ~100 KB are sent as an attached file. Verify the result yourself - it is an untrusted draft. Call opencode_policy for the full rules.',
     inputSchema: { type: 'object', required: ['prompt', 'tier'], properties: {
       prompt: { ...S, description: 'Full task: context, absolute paths, desired output, test command; the agent has no memory of this conversation' },
       tier: { ...S, description: 'easy | medium (delegable) | hard | unsure (refused: stays on Claude)' },
@@ -157,16 +172,18 @@ const tools = [
       model: { ...S, description: `provider/model[#variant]; default ${DEFAULT_MODEL || "opencode's own default (set OPENCODE_BRIDGE_MODEL to change)"}` }, session: { ...S, description: 'Previous task id to continue its session' },
       lane: { ...S, description: 'Lane / project short name for the session title (capitals), default = cwd name' },
       title: { ...S, description: 'Full session title; overrides the generated "<lane>/<agent>: <task>" (keep the convention)' },
-      timeout_minutes: { ...N, description: `wall-clock limit, default ${DEFAULT_TIMEOUT_MIN} (1-1440); the process group is killed when it is reached` } } } },
+      timeout_minutes: { ...N, description: `wall-clock limit, default ${DEFAULT_TIMEOUT_MIN} (1-1440); the process group is killed when it is reached` },
+      wait_s: { ...N, description: `optional: wait up to this many seconds (cap ${MAX_WAIT_S}) and return the outcome if the task finishes in time` } } } },
   { name: 'opencode_policy', description: 'READ-ONLY. Show the delegation policy that opencode_start enforces: the ACTIVE routing mode for a directory and where it was detected, the agents allowed in that mode, the tier rules (what to delegate / keep), the verification rules and the roster. Call it before delegating if unsure which mode applies.',
     inputSchema: { type: 'object', properties: { cwd: { ...S, description: 'directory to evaluate (default: the bridge root)' }, mode: { ...S, description: 'preview what an explicit mode would do' } } } },
-  { name: 'opencode_status', description: 'Status of a task started by this bridge (running/done/failed), elapsed time and session id.', inputSchema: { type: 'object', required: ['id'], properties: { id: S } } },
-  { name: 'opencode_result', description: 'Output of a task started by this bridge, with the failure kind and advice when it failed (rate_limit, quota, context_length, output_limit, overloaded, auth, model, agent, invalid_request, network, timeout, spawn, exit). Large outputs are cut to the last 60000 characters unless `head` / `tail` is given.', inputSchema: { type: 'object', required: ['id'], properties: { id: S, tail: { ...N, description: 'only the last N characters' }, head: { ...N, description: 'only the first N characters' } } } },
-  { name: 'opencode_cancel', description: 'Cancel a running or retrying task started by this bridge: SIGTERM, then SIGKILL, to its whole process group (never touches other sessions). A finished task is reported as such.', inputSchema: { type: 'object', required: ['id'], properties: { id: S } } },
-  { name: 'opencode_list', description: 'List tasks started by this bridge. For ALL opencode sessions use opencode_sessions.', inputSchema: { type: 'object', properties: {} } },
-  { name: 'opencode_sessions', description: 'READ-ONLY. List opencode sessions of the background service across all projects (newest first): id, state (running / succeeded / failed / interrupted / stale?), agent, age, tokens, directory, title. Use state=running to see what is active now; a session whose last update is older than ~45 min and has no outcome is shown as "stale?".',
+  { name: 'opencode_status', description: 'Status of a task started by this bridge or by an earlier instance of it (running / retrying / done / failed / timeout / cancelled / interrupted / lost), elapsed time and session id. Optional wait_s waits (bounded, at most 25 s) until the task finishes.', inputSchema: { type: 'object', required: ['id'], properties: { id: S, wait_s: { ...N, description: `wait up to this many seconds (cap ${MAX_WAIT_S}) for the task to finish` } } } },
+  { name: 'opencode_result', description: 'Output of a task started by this bridge, with the failure kind and advice when it failed (rate_limit, quota, context_length, output_limit, overloaded, auth, model, agent, invalid_request, network, timeout, spawn, exit). interrupted (client or service stopped) is reported separately from failed, with advice. Large outputs are cut to the last 60000 characters unless `head` / `tail` is given. A running task answers with its progress; with wait_s (bounded, at most 25 s) the call waits for the outcome and otherwise returns [still_running] with progress and the next-poll hint.', inputSchema: { type: 'object', required: ['id'], properties: { id: S, tail: { ...N, description: 'only the last N characters' }, head: { ...N, description: 'only the first N characters' }, wait_s: { ...N, description: `wait up to this many seconds (cap ${MAX_WAIT_S}) for the task to finish` } } } },
+  { name: 'opencode_cancel', description: 'Cancel a running or retrying task started by this bridge: the opencode service is asked to interrupt its session (abort endpoint) and its client process group gets SIGTERM, then SIGKILL; the task and its session are then shown as cancelled, not interrupted. `id` may also be a session id (ses_...) that no bridge task owns: it is interrupted through the service (use only for sessions you started). A finished task is reported as such.', inputSchema: { type: 'object', required: ['id'], properties: { id: { ...S, description: 'task id, or a session id (ses_...)' } } } },
+  { name: 'opencode_resume', description: 'Continue a task that ended as interrupted, lost, failed, timeout or cancelled: starts a new task with the original prompt plus the progress so far (partial output, last steps). READ-ONLY agents (explorer, librarian, deep-research, oracle) resume directly. EDITING agents (fixer, designer, worker, general) are refused until you pass acknowledge_edits:true: the reply shows `git status --short` of the working directory so you can see what the interrupted run changed first, and the new run is told to inspect the tree before editing. same_session:true continues the same opencode session instead of starting a new one.', inputSchema: { type: 'object', required: ['id'], properties: { id: { ...S, description: 'task id (opencode_list)' }, acknowledge_edits: { ...B, description: 'editing agents: confirm you looked at the working tree and want the work continued' }, same_session: { ...B, description: 'continue the same opencode session (shorter prompt) instead of a new one' }, note: { ...S, description: 'extra instruction for the continued run' }, timeout_minutes: N } } },
+  { name: 'opencode_list', description: 'List tasks started by this bridge and by earlier instances of it (persisted, newest 50 by default). For ALL opencode sessions use opencode_sessions.', inputSchema: { type: 'object', properties: { limit: { ...N, description: 'how many of the newest tasks (default 50, max 500)' }, state: { ...S, description: 'only this state, e.g. running | interrupted | failed | done' } } } },
+  { name: 'opencode_sessions', description: 'READ-ONLY. List opencode sessions of the background service across all projects (newest first): id, state (running / succeeded / failed / interrupted / cancelled / stale?), agent, age, tokens, directory, title. Use state=running to see what is active now; a session whose last update is older than ~45 min and has no outcome is shown as "stale?".',
     inputSchema: { type: 'object', properties: {
-      state: { ...S, description: 'running (default: all) | active | finished | succeeded | failed | interrupted | stale | all' },
+      state: { ...S, description: 'running (default: all) | active | finished | succeeded | failed | interrupted | cancelled | stale | all' },
       agent: { ...S, description: 'only this agent, e.g. deep-research' },
       directory: { ...S, description: 'only sessions whose directory contains this text' },
       search: { ...S, description: 'only titles containing this text (server-side search)' },
@@ -188,7 +205,11 @@ const tools = [
 
 function inside(dir) { const r = realpathSync(dir); return r === ROOT || r.startsWith(ROOT + '/'); }
 
-// ---------- own tasks ----------
+// ---------- own tasks (v0.6: persistent, detached, supervised by a runner process) ----------
+// A task is a directory STATE_DIR/tasks/<id>/ written by this bridge (spec) and by a detached RUNNER process
+// (`server.mjs --runner <dir>`): the runner starts `opencode run`, sends its output to files, enforces the deadline, retries,
+// falls back, and writes the final state. Neither a restart of this MCP server nor of Claude Code touches a running task;
+// every bridge instance can read every task from the files (see docs/STATE.md).
 const clip = (s, n) => { s = String(s ?? '').replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
 const cleanTitle = (s) => String(s ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
 function makeTitle({ lane, agent, prompt, cwd }) {
@@ -196,70 +217,229 @@ function makeTitle({ lane, agent, prompt, cwd }) {
   const first = String(prompt).split('\n').map((x) => x.trim()).find((x) => x && !/^rules?:/i.test(x)) || 'task';
   return cleanTitle(`${l}/${agent}: ${clip(first, 60)}`);
 }
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+const FINAL = new Set(['done', 'failed', 'timeout', 'cancelled', 'interrupted', 'lost']);
+const isFinal = (s) => FINAL.has(s);
+const TASKS_DIR = join(STATE_DIR, 'tasks'), CANCEL_DIR = join(STATE_DIR, 'cancelled');
+const tdir = (id) => join(TASKS_DIR, id);
+const ensureState = () => { for (const d of [TASKS_DIR, CANCEL_DIR]) mkdirSync(d, { recursive: true, mode: 0o700 }); };
+function atomicWrite(file, data) { const tmpf = `${file}.${process.pid}.${randomBytes(3).toString('hex')}.tmp`; writeFileSync(tmpf, data, { mode: 0o600 }); renameSync(tmpf, file); }
+const readJson = (file) => { try { return JSON.parse(readFileSync(file, 'utf8')); } catch { return null; } };
+const writeTask = (t) => atomicWrite(join(tdir(t.id), 'task.json'), JSON.stringify(t));
+function readTask(id) { if (!/^[0-9a-f]{8}$/.test(String(id))) return null; const t = readJson(join(tdir(id), 'task.json')); if (!t) return null; t.runner ??= readJson(join(tdir(id), 'runner.json')); return t; }
+function registry() { let ids = []; try { ids = readdirSync(TASKS_DIR); } catch {} return ids.map(readTask).filter(Boolean); }
+const markCancelledSession = (sid) => { try { ensureState(); writeFileSync(join(CANCEL_DIR, String(sid).replace(/[^A-Za-z0-9_-]/g, '')), String(Date.now())); } catch {} };
+const isCancelledSession = (sid) => { try { return existsSync(join(CANCEL_DIR, String(sid).replace(/[^A-Za-z0-9_-]/g, ''))); } catch { return false; } };
 
-const live = (t) => t.status === 'running' || t.status === 'retrying';
-const runningTasks = () => [...tasks.values()].filter(live);
-function killGroup(t, sig) { // the whole process group: opencode's own children (shell tools) must not outlive it
-  const p = t.proc; if (!p?.pid || p.exitCode !== null || p.signalCode !== null) return;
-  try { process.kill(-p.pid, sig); } catch { try { p.kill(sig); } catch {} }
+// process references {pid, start}: start = field 22 of /proc/<pid>/stat, so a recycled pid is not mistaken for our process
+function procInfo(pid) { if (!PROCFS) return null; try { const s = readFileSync(`/proc/${pid}/stat`, 'utf8'); const r = s.slice(s.lastIndexOf(')') + 2).split(' '); return { state: r[0], start: r[19] }; } catch { return null; } }
+const pidRef = (pid) => ({ pid, start: procInfo(pid)?.start ?? null });
+function pidAlive(p) {
+  if (!p?.pid) return false;
+  try { process.kill(p.pid, 0); } catch (e) { if (e.code !== 'EPERM') return false; }
+  const i = procInfo(p.pid); if (i) { if (i.state === 'Z') return false; if (p.start && i.start !== p.start) return false; }
+  return true;
 }
-function cleanupTmp(t) { if (t.tmpdir) { try { rmSync(t.tmpdir, { recursive: true, force: true }); } catch {} t.tmpdir = null; } }
-function clearTimers(t) { for (const k of ['timeoutTimer', 'killTimer', 'retryTimer']) if (t[k]) { clearTimeout(t[k]); t[k] = null; } }
-function prune() { const fin = [...tasks.values()].filter((t) => t.ended).sort((a, b) => a.ended - b.ended); for (const t of fin.slice(0, Math.max(0, fin.length - KEEP_FINISHED))) tasks.delete(t.id); }
+function killRef(p, sig) { if (!pidAlive(p)) return false; try { process.kill(-p.pid, sig); return true; } catch { try { process.kill(p.pid, sig); return true; } catch { return false; } } } // the child is its own process group leader
+
 function spawnFailure(e) {
   if (e?.code === 'ENOENT') return { kind: 'spawn', message: 'the opencode binary was not found on PATH', advice: 'Install opencode (>= 2) and make sure the process that runs the bridge has it on PATH.', transient: false };
   if (e?.code === 'E2BIG') return { kind: 'spawn', message: 'argument list too long', advice: 'The prompt did not fit on the command line (it is normally attached as a file automatically).', transient: false };
   return { kind: 'spawn', message: clip(e?.message ?? e, 300), advice: '', transient: false };
 }
 
-function launch(t) {
-  t.attempts++; t.text = ''; t.textTruncated = false; t.errors = []; t.err = ''; t.exitCode = null; t.timedOut = false; t.failure = null; t.sessionID = t.resume;
-  let p;
-  try { p = spawn('opencode', t.args, { cwd: t.cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PWD: t.cwd, OPENCODE_CONFIG_CONTENT: WORKER_CONFIG } }); } // opencode resolves its project dir from $PWD, not the spawn cwd
-  catch (e) { return finalize(t, null, null, e); }
-  t.proc = p;
-  createInterface({ input: p.stdout }).on('line', (l) => {
-    let j; try { j = JSON.parse(l); } catch { return; }
-    if (!j || typeof j !== 'object') return;
-    t.sessionID ||= j.sessionID;
-    if (j.type === 'text') { t.text += j.part?.text ?? ''; if (t.text.length > MAX_TEXT) { t.text = t.text.slice(-MAX_TEXT); t.textTruncated = true; } }
-    else if (j.type === 'error' && t.errors.length < 20) t.errors.push(errText(j.error ?? j.message ?? j));
-  });
-  p.stderr.on('data', (d) => { t.err = (t.err + d).slice(-4000); });
-  p.on('error', (e) => finalize(t, null, null, e, p));
-  p.on('close', (code, sig) => finalize(t, code, sig, null, p));
-  // a grandchild (a background process the agent started) can keep the pipes open after opencode itself has exited
-  p.on('exit', (code, sig) => { const h = setTimeout(() => finalize(t, code, sig, null, p), 2000); h.unref?.(); });
-  t.timeoutTimer = setTimeout(() => { t.timedOut = true; killGroup(t, 'SIGTERM'); t.killTimer = setTimeout(() => killGroup(t, 'SIGKILL'), KILL_GRACE_MS); }, t.timeoutMs);
+// The event stream of one attempt (`opencode run --format json`, one JSON object per line) is read incrementally from its file.
+const evCache = new Map();
+function newEv() { return { off: 0, partial: '', size: 0, lastAt: 0, sessionID: undefined, text: '', textTruncated: false, errors: [], steps: 0, tools: [], tokens: { input: 0, output: 0 } }; }
+function readEvents(t) {
+  const key = `${t.id}:${t.attempt || 1}`; let e = evCache.get(key);
+  if (!e) { e = newEv(); evCache.set(key, e); if (evCache.size > 300) evCache.delete(evCache.keys().next().value); }
+  let fd; try { fd = openSync(join(tdir(t.id), `out.${t.attempt || 1}.jsonl`), 'r'); } catch { return e; }
+  try {
+    const st = fstatSync(fd); if (st.size < e.off) Object.assign(e, newEv());
+    e.size = st.size; e.lastAt = st.mtimeMs;
+    const buf = Buffer.alloc(1 << 20);
+    while (e.off < st.size) {
+      const n = readSync(fd, buf, 0, buf.length, e.off); if (n <= 0) break; e.off += n;
+      e.partial += buf.toString('utf8', 0, n); // (a multi-byte character cut at the chunk edge is repaired by the next chunk only for ASCII-safe JSON; events are JSON-escaped)
+      const lines = e.partial.split('\n'); e.partial = lines.pop(); if (e.partial.length > 16_000_000) e.partial = '';
+      for (const l of lines) ingest(e, l);
+    }
+  } catch {} finally { try { closeSync(fd); } catch {} }
+  return e;
+}
+function ingest(e, l) {
+  let j; try { j = JSON.parse(l); } catch { return; }
+  if (!j || typeof j !== 'object') return;
+  e.sessionID ||= j.sessionID;
+  if (j.type === 'text') { e.text += j.part?.text ?? ''; if (e.text.length > MAX_TEXT) { e.text = e.text.slice(-MAX_TEXT); e.textTruncated = true; } }
+  else if (j.type === 'error' && e.errors.length < 20) e.errors.push(errText(j.error ?? j.message ?? j));
+  else if (j.type === 'step_start') e.steps++;
+  else if (j.type === 'step_finish') { e.tokens.input += Number(j.part?.tokens?.input) || 0; e.tokens.output += Number(j.part?.tokens?.output) || 0; }
+  else if (j.type === 'tool_use') { const p = j.part || {}; e.tools.push({ name: p.tool || '?', input: clip(typeof p.state?.input === 'string' ? p.state.input : JSON.stringify(p.state?.input ?? {}), 90), status: p.state?.status || '', at: j.timestamp || 0 }); if (e.tools.length > 6) e.tools.shift(); }
+}
+function readTailFile(file, n) { let fd; try { fd = openSync(file, 'r'); const st = fstatSync(fd); const len = Math.min(n, st.size); const b = Buffer.alloc(len); readSync(fd, b, 0, len, st.size - len); return b.toString('utf8'); } catch { return ''; } finally { try { closeSync(fd); } catch {} } }
+
+const AUTO_ABORT = /aborted|session interrupted/i;
+const FINALIZE_PROMPT = 'The step limit of this agent was reached (the provider rejects the forced final step). Do NOT call any more tools. Write your final report NOW from what you have already gathered: findings with file paths and line numbers, what is verified and what is not, open questions. If something is missing, say so instead of searching.';
+function buildArgs(t, { sessionID, message } = {}) { // argv of one attempt
+  const a = [...t.head];
+  if (sessionID) a.push('-s', sessionID); else a.push('--title', t.title);
+  if (t.attachFile) a.push('-f', t.attachFile);
+  a.push(message ?? t.message);
+  return a;
+}
+const lastAssistantText = (msgs) => { for (const m of msgs) { if (m.type !== 'assistant') continue; const tx = (m.content || []).filter((b) => b.type === 'text' && b.text).map((b) => b.text.trim()).join('\n'); if (tx) return tx; } return ''; }; // msgs: newest first (as the API returns them)
+
+// ----- the runner: one detached process per task; survives the MCP server and Claude Code -----
+async function runner(dir) {
+  const rd = (f) => join(dir, f);
+  let t = readJson(rd('task.json')); if (!t) process.exit(2);
+  const save = (patch) => { t = { ...(readJson(rd('task.json')) || t), ...patch }; atomicWrite(rd('task.json'), JSON.stringify(t)); };
+  const cancelled = () => existsSync(rd('cancelled'));
+  let child = null, killedAt = 0;
+  const stopChild = () => { if (!child || killedAt) return; killedAt = Date.now(); killRef(child, 'SIGTERM'); const h = setTimeout(() => killRef(child, 'SIGKILL'), KILL_GRACE_MS); h.unref?.(); };
+  for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { try { writeFileSync(rd('cancelled'), String(Date.now()), { flag: 'a' }); } catch {} stopChild(); });
+  process.on('SIGHUP', () => {});
+  const cleanup = () => { if (t.attachDir) { try { rmSync(t.attachDir, { recursive: true, force: true }); } catch {} } };
+  const end = (status, failure = null, extra = {}) => { // a cancel (marker file) always wins
+    cleanup();
+    if (cancelled() && status !== 'done') { status = 'cancelled'; failure = null; }
+    save({ status, failure, ended: Date.now(), retryAt: null, ...extra }); process.exit(0);
+  };
+  const wait = async (ms) => { const until = Date.now() + ms; while (Date.now() < until && !cancelled()) await sleepMs(Math.min(200, until - Date.now())); };
+  let attempt = t.attempt || 0, sessionID = t.resumeSession, finalizeMsg = null, fallback = null;
+  const attemptText = () => readEvents({ id: t.id, attempt });
+  for (;;) {
+    if (cancelled()) end('cancelled');
+    if (Date.now() > t.deadline) end('timeout', { kind: 'timeout', message: `no result after ${Math.round(t.timeoutMs / 1000)} s`, advice: 'Split the task into smaller pieces or raise timeout_minutes / OPENCODE_BRIDGE_TIMEOUT_MIN. Any partial output is in opencode_result.', transient: false });
+    attempt++;
+    const argv = buildArgs(t, { sessionID: sessionID || undefined, message: finalizeMsg || undefined });
+    let spawnErr = null, timedOut = false;
+    const o = openSync(rd(`out.${attempt}.jsonl`), 'a', 0o600), er = openSync(rd(`err.${attempt}.log`), 'a', 0o600);
+    killedAt = 0; child = null;
+    const exited = new Promise((resolve) => {
+      let p; try { p = spawn('opencode', argv, { cwd: t.cwd, detached: true, stdio: ['ignore', o, er], env: { ...process.env, PWD: t.cwd, ...(t.backend === 'standalone' ? { OPENCODE_CONFIG_CONTENT: WORKER_CONFIG } : {}) } }); } // opencode resolves its project dir from $PWD, not the spawn cwd
+      catch (e) { spawnErr = e; return resolve({}); }
+      child = pidRef(p.pid);
+      p.on('error', (e) => { spawnErr = e; resolve({}); });
+      p.on('exit', (code, sig) => resolve({ code, sig }));
+      save({ attempt, child, status: 'running', retryAt: null, ...(sessionID ? { sessionID } : {}), ...(finalizeMsg ? { fallback: 'finalize-in-session' } : {}) });
+    });
+    closeSync(o); closeSync(er);
+    const timer = setInterval(() => {
+      const ev = attemptText();
+      if (ev.sessionID && ev.sessionID !== t.sessionID) save({ sessionID: ev.sessionID });
+      if (!timedOut && Date.now() > t.deadline) { timedOut = true; stopChild(); }
+      if (cancelled()) stopChild();
+    }, 250);
+    const { code, sig } = await exited; clearInterval(timer);
+    const ev = attemptText(); if (ev.sessionID) sessionID = ev.sessionID; else sessionID ||= t.sessionID;
+    const errTail = readTailFile(rd(`err.${attempt}.log`), 4000);
+    const baseExtra = { exitCode: code ?? null, signal: sig ?? null, ...(sessionID ? { sessionID } : {}) };
+    if (cancelled()) end('cancelled', null, baseExtra);
+    if (spawnErr) end('failed', spawnFailure(spawnErr), baseExtra);
+    if (timedOut) end('timeout', { kind: 'timeout', message: `no result after ${t.timeoutMs >= 60000 ? Math.round(t.timeoutMs / 60000) + ' min' : t.timeoutMs + ' ms'}; the process group was killed`, advice: 'Split the task into smaller pieces or raise timeout_minutes / OPENCODE_BRIDGE_TIMEOUT_MIN. Any partial output is in opencode_result.', transient: false }, baseExtra);
+    // The client died (signal / crash) but the service may still be running the session: attach to it instead of declaring a loss.
+    let svc = null;
+    if (t.backend === 'service' && sessionID && (sig || (code !== 0 && !ev.errors.length))) svc = await reattach(sessionID, { deadline: t.deadline, stop: cancelled });
+    if (svc?.outcome === 'succeeded') { if (svc.text) writeFileSync(rd('result.txt'), svc.text, { mode: 0o600 }); end('done', null, { ...baseExtra, reattached: true }); }
+    if (svc?.outcome === 'interrupted') end('interrupted', { kind: 'interrupted', message: 'the session was interrupted in the service' + (sig ? ` (client killed by ${sig})` : ''), advice: INTERRUPTED_ADVICE, transient: false }, { ...baseExtra, reattached: true });
+    let failure = null;
+    if (svc?.outcome === 'failed') { const c = classify(svc.error); failure = { kind: c.kind === 'other' ? 'exit' : c.kind, message: clip(svc.error, 400), advice: c.advice, transient: c.transient }; }
+    else if (code !== 0 || (ev.errors.length && !ev.text)) {
+      const errs = ev.errors.join(' ');
+      if (!ev.errors.length && sig) end('interrupted', { kind: 'interrupted', message: `the opencode client was killed by ${sig} before it reported an outcome`, advice: INTERRUPTED_ADVICE, transient: false }, baseExtra);
+      if (ev.errors.length && ev.errors.every((x) => AUTO_ABORT.test(x))) end('interrupted', { kind: 'interrupted', message: clip(ev.errors[0], 300), advice: INTERRUPTED_ADVICE, transient: false }, baseExtra);
+      const msg = ev.errors[0] || errTail.trim().split('\n').filter(Boolean).slice(-1)[0] || (sig ? `killed by signal ${sig}` : `exit code ${code}`);
+      const c = classify(`${errs} ${errTail}`);
+      failure = { kind: c.kind === 'other' ? (sig ? 'signal' : 'exit') : c.kind, message: clip(msg, 400), advice: c.advice, transient: c.transient };
+    }
+    if (!failure) end('done', null, baseExtra);
+    // step limit (provider rejects the forced last step): let a read-only agent finish its report in the same session, once
+    if (failure.kind === 'step_limit' && READ_ONLY.has(t.agent) && sessionID && !finalizeMsg) { finalizeMsg = `${guardFor(t.agent)}\n${AGENT_RULE(t.agent)}\n\n${FINALIZE_PROMPT}`; fallback = 'finalize-in-session'; save({ ...baseExtra, fallbackNote: `attempt ${attempt} hit the step limit (${failure.message.slice(0, 80)}); the report was requested in the same session` }); continue; }
+    // retry only what is safe to replay: transient provider/network errors of READ-ONLY agents that produced no output yet
+    if (failure.transient && READ_ONLY.has(t.agent) && !ev.text && attempt <= t.maxRetries) {
+      const delay = t.retryDelayMs * 3 ** (attempt - 1);
+      save({ ...baseExtra, status: 'retrying', failure, retryAt: Date.now() + delay, attempt }); await wait(delay); continue;
+    }
+    end('failed', failure, baseExtra);
+  }
+}
+const INTERRUPTED_ADVICE = 'The run was stopped before it reported an outcome (the client or the opencode service was stopped or restarted, the machine slept, or someone interrupted the session). It is not a provider failure. Partial work is in the session history (opencode_session_output). Read-only agents: opencode_resume continues it; editing agents: check `git status` first (opencode_resume shows it and needs acknowledge_edits).';
+// One consistent look at a session: its record and whether the service is running it. A session can finish between the two
+// requests, so a record without an outcome that is not active is read once more.
+async function sessionState(sid) {
+  let s = (await api('GET', `/api/session/${encodeURIComponent(sid)}`)).data;
+  const active = (await activeIds()).has(sid);
+  if (!active && s && !s.outcome) s = (await api('GET', `/api/session/${encodeURIComponent(sid)}`)).data;
+  return { s, active };
+}
+// Poll the service for a session whose client is gone. Returns {outcome, text?, error?} or null when the session cannot be found.
+async function reattach(sid, { deadline = Infinity, stop = () => false } = {}) {
+  let fails = 0, first = true;
+  for (;;) {
+    let s, active;
+    try { ({ s, active } = await sessionState(sid)); fails = 0; } catch { if (first || ++fails >= 3) return null; await sleepMs(REATTACH_POLL_MS); continue; }
+    first = false;
+    if (!s || typeof s !== 'object') return null;
+    // an active session is running whatever an earlier turn left in `outcome`
+    if (!active && s.outcome) {
+      let text = '', error = '';
+      try { const m = (await api('GET', `/api/session/${encodeURIComponent(sid)}/message`, { limit: 40 })).data ?? []; text = lastAssistantText(m); error = errText(m.map((x) => x.error).find(Boolean)); } catch {}
+      return { outcome: s.outcome, text, error };
+    }
+    if (!active && Date.now() - (s.time?.updated ?? s.time?.created ?? 0) > REATTACH_QUIET_MS) return { outcome: 'interrupted', text: '', error: '' };
+    if (stop() || Date.now() > deadline) return null;
+    await sleepMs(REATTACH_POLL_MS);
+  }
 }
 
-function finalize(t, code, sig, spawnErr, p) {
-  if (p) { if (t.finalizedProc === p) return; t.finalizedProc = p; }
-  if (t.proc !== p && p) return; // a stale process of an earlier attempt
-  clearTimers(t);
-  if (t.status === 'cancelled') { cleanupTmp(t); t.ended ??= Date.now(); return; }
-  t.exitCode = code;
-  let failure = null;
-  if (spawnErr) failure = spawnFailure(spawnErr);
-  else if (t.timedOut) failure = { kind: 'timeout', message: `no result after ${t.timeoutMs >= 60000 ? Math.round(t.timeoutMs / 60000) + ' min' : t.timeoutMs + ' ms'}; the process group was killed`, advice: 'Split the task into smaller pieces or raise timeout_minutes / OPENCODE_BRIDGE_TIMEOUT_MIN. Any partial output is in opencode_result.', transient: false };
-  else if (code !== 0 || (t.errors.length && !t.text)) {
-    const msg = t.errors[0] || t.err.trim().split('\n').filter(Boolean).slice(-1)[0] || (sig ? `killed by signal ${sig}` : `exit code ${code}`);
-    const c = classify(`${t.errors.join(' ')} ${t.err}`);
-    failure = { kind: c.kind === 'other' ? (sig ? 'signal' : 'exit') : c.kind, message: clip(msg, 400), advice: c.advice, transient: c.transient };
+// ----- the bridge side: snapshots of tasks, reconcile, start / cancel / resume -----
+const live = (s) => !isFinal(s.status);
+async function snap(id) {
+  const t = readTask(id); let inRoot = false; try { inRoot = !!t && inside(t.cwd); } catch {}
+  if (!t || !inRoot) throw new Error('unknown task (opencode_list shows this bridge\'s tasks; for any other session use opencode_sessions)');
+  const ev = readEvents(t);
+  let status = t.status, note = '';
+  if (!isFinal(status)) {
+    const runnerUp = pidAlive(t.runner), childUp = pidAlive(t.child);
+    if (runnerUp) { /* supervised */ }
+    else if (!t.runner && Date.now() - t.started < 15000) { /* the runner is starting */ }
+    else if (childUp) { note = 'supervisor process gone, the run continues'; if (Date.now() > t.deadline) { killRef(t.child, 'SIGTERM'); const h = setTimeout(() => killRef(t.child, 'SIGKILL'), KILL_GRACE_MS); h.unref?.(); } }
+    else {
+      // The runner writes its final state BEFORE it exits, so once it is seen dead the file is definitive: read it again
+      // (a record read earlier may predate that write).
+      const fresh = readTask(id);
+      if (fresh && isFinal(fresh.status)) { Object.assign(t, fresh); status = t.status; }
+      else { const patch = await reconcile(t, ev); if (patch) { Object.assign(t, patch); status = t.status; } else note = 'the opencode service could not be asked about this session'; }
+    }
   }
-  if (!failure) { t.status = 'done'; t.ended = Date.now(); cleanupTmp(t); return; }
-  t.failure = failure;
-  // Retry only what is safe to replay: transient provider/network errors of READ-ONLY agents that produced no output yet.
-  if (failure.transient && READ_ONLY.has(t.agent) && !t.text && t.attempts <= MAX_RETRIES) {
-    const delay = RETRY_DELAY_MS * 3 ** (t.attempts - 1);
-    t.status = 'retrying'; t.retryAt = Date.now() + delay;
-    t.retryTimer = setTimeout(() => { t.retryTimer = null; t.status = 'running'; launch(t); }, delay);
-    return;
-  }
-  t.status = failure.kind === 'timeout' ? 'timeout' : 'failed'; t.ended = Date.now(); cleanupTmp(t);
+  const textFile = join(tdir(id), 'result.txt');
+  const text = existsSync(textFile) ? readFileSync(textFile, 'utf8') : ev.text;
+  return { t, ev, status, text, note };
+}
+// The runner is gone and so is its opencode client, without a final record: ask the service what became of the session.
+async function reconcile(t, ev) {
+  const done = (status, failure, extra = {}) => { const cur = readTask(t.id); if (cur && isFinal(cur.status)) return cur; /* never overwrite a final state */ const n = { ...(cur || t), status, failure, ended: Date.now(), retryAt: null, ...extra }; try { writeTask(n); } catch {} return n; };
+  if (existsSync(join(tdir(t.id), 'cancelled'))) return done('cancelled', null);
+  if (Date.now() > t.deadline) return done('timeout', { kind: 'timeout', message: `no result after ${Math.round(t.timeoutMs / 1000)} s; the supervisor was gone`, advice: 'Split the task into smaller pieces or raise timeout_minutes. Partial output is in opencode_result.', transient: false });
+  const sid = ev.sessionID || t.sessionID;
+  if (!sid) return done('lost', { kind: 'lost', message: 'the run ended before opencode created a session (the supervisor and the client are gone); nothing can be recovered', advice: 'Start the task again (opencode_start with the same prompt; opencode_resume re-sends it).', transient: false });
+  let s, act; try { ({ s, active: act } = await sessionState(sid)); } catch (e) { if (/404|not found/i.test(String(e.message))) return done('lost', { kind: 'lost', message: `session ${sid} no longer exists in the service`, advice: 'Start the task again (opencode_resume re-sends it).', transient: false }); return null; }
+  if (act || (!s?.outcome && Date.now() - (s?.time?.updated ?? 0) < REATTACH_QUIET_MS)) return { ...t, sessionID: sid, status: 'running' }; // still executing in the service, only its supervisor is gone: the next call asks again
+  if (s?.outcome === 'succeeded') { let text = ''; try { text = lastAssistantText((await api('GET', `/api/session/${encodeURIComponent(sid)}/message`, { limit: 40 })).data ?? []); } catch {} if (text) writeFileSync(join(tdir(t.id), 'result.txt'), text, { mode: 0o600 }); return done('done', null, { sessionID: sid, reconciled: true }); }
+  if (s?.outcome === 'failed') { let msg = ''; try { msg = errText(((await api('GET', `/api/session/${encodeURIComponent(sid)}/message`, { limit: 40 })).data ?? []).map((x) => x.error).find(Boolean)); } catch {} const c = classify(msg); return done('failed', { kind: c.kind === 'other' ? 'exit' : c.kind, message: clip(msg || 'the session failed', 400), advice: c.advice, transient: c.transient }, { sessionID: sid, reconciled: true }); }
+  if (s?.outcome === 'interrupted') return done('interrupted', { kind: 'interrupted', message: 'the session was interrupted in the service', advice: INTERRUPTED_ADVICE, transient: false }, { sessionID: sid, reconciled: true });
+  return done('interrupted', { kind: 'interrupted', message: 'the run ended without an outcome (client and supervisor gone, the service is not running the session)', advice: INTERRUPTED_ADVICE, transient: false }, { sessionID: sid, reconciled: true });
 }
 
-function start(a) {
+const elapsed = (t) => Math.round(((isFinal(t.status) ? t.ended ?? Date.now() : Date.now()) - t.started) / 1000);
+function liveTasks() { return registry().sort((x, y) => x.started - y.started).filter((t) => !isFinal(t.status) && (pidAlive(t.runner) || pidAlive(t.child) || (!t.runner && Date.now() - t.started < 15000)) && (t.bridge?.pid === process.pid || !pidAlive(t.bridge))); }
+function gitStatus(cwd) { try { return execFileSync('git', ['-C', cwd, 'status', '--short'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '(clean: no changes)'; } catch { return '(not a git repository, or git is unavailable: check the files yourself)'; } }
+
+let lastStart = 0;
+function start(a, { resume } = {}) {
   const str = (v) => (v === undefined || v === null ? undefined : String(v));
   const prompt = str(a.prompt)?.trim();
   if (!prompt) throw new Error('prompt is empty: pass the full task (context, absolute paths, desired output, test command)');
@@ -271,42 +451,91 @@ function start(a) {
   const model = str(a.model)?.trim() || DEFAULT_MODEL;
   const det = detectMode(cwd, str(a.mode)?.trim());
   const agent = str(a.agent)?.trim().toLowerCase() || (det.mode === 'sensitive' ? 'explorer' : process.env.OPENCODE_BRIDGE_AGENT || 'worker');
-  checkDelegation({ agent, tier, mechanical: a.mechanical === true || a.mechanical === 'true', prompt, mode: det.mode });
-  const sessionArg = str(a.session)?.trim(); let prev;
+  checkDelegation({ agent, tier, mechanical: a.mechanical === true || a.mechanical === 'true', prompt: resume ? resume.userPrompt : prompt, mode: det.mode });
+  const sessionArg = str(a.session)?.trim(); let prevSession;
   if (sessionArg) {
-    prev = tasks.get(sessionArg);
-    if (!prev) throw new Error(`session continuation: unknown task id "${sessionArg}" (opencode_list shows this bridge's tasks)`);
-    if (!prev.sessionID) throw new Error('session continuation: that task has no session id yet (still starting, or it failed before a session was created)');
+    if (/^ses_[A-Za-z0-9]+$/.test(sessionArg)) prevSession = sessionArg;
+    else { const prev = readTask(sessionArg); if (!prev) throw new Error(`session continuation: unknown task id "${sessionArg}" (opencode_list shows this bridge's tasks)`); prevSession = prev.sessionID || readEvents(prev).sessionID; if (!prevSession) throw new Error('session continuation: that task has no session id yet (still starting, or it failed before a session was created)'); }
   }
-  const running = runningTasks();
+  const running = liveTasks();
   if (running.length >= MAX_PARALLEL) throw new Error(`parallel limit reached (${running.length}/${MAX_PARALLEL} tasks running or waiting to retry): ${running.map((r) => `${r.id} ${r.agent} "${clip(r.title, 40)}"`).join('; ')}. Wait for one to finish (opencode_status), cancel one (opencode_cancel), or raise OPENCODE_BRIDGE_MAX_PARALLEL.`);
   const id = randomBytes(4).toString('hex');
-  const finalTitle = cleanTitle(a.title) || makeTitle({ lane: str(a.lane), agent, prompt, cwd });
-  const args = ['run', '--standalone', '--agent', agent, '--auto', '--format', 'json', ...(model ? ['-m', model] : [])];
-  if (prev?.sessionID) args.push('-s', prev.sessionID); // a continued session keeps its title
-  else args.push('--title', finalTitle);
+  const finalTitle = cleanTitle(a.title) || makeTitle({ lane: str(a.lane), agent, prompt: resume ? resume.userPrompt : prompt, cwd });
+  // roster agents run through the opencode service (the run survives its client and can be interrupted through the API);
+  // the bridge's own `worker` is defined inline and needs a private (--standalone) instance
+  const backend = BACKEND === 'auto' ? (agent === 'worker' ? 'standalone' : 'service') : BACKEND;
+  const head = ['run', ...(backend === 'standalone' ? ['--standalone'] : []), '--agent', agent, '--auto', '--format', 'json', ...(model ? ['-m', model] : [])];
   const full = `${guardFor(agent)}\n${AGENT_RULE(agent)}\n\n${prompt}`;
-  let message = full, tmp = null;
+  let message = full, attachDir = null, attachFile = null;
+  ensureState();
   if (Buffer.byteLength(full) > ARG_LIMIT) { // one argv entry is limited to ~128 KiB on Linux: attach the task as a file instead
-    tmp = mkdtempSync(join(tmpdir(), 'ocb-')); const f = join(tmp, 'task.md'); writeFileSync(f, full, { mode: 0o600 });
-    args.push('-f', f); message = `${guardFor(agent)}\n${AGENT_RULE(agent)}\n\nThe complete task is in the attached file task.md. Read it first and follow it exactly.`;
+    attachDir = mkdtempSync(join(tmpdir(), 'ocb-')); attachFile = join(attachDir, 'task.md'); writeFileSync(attachFile, full, { mode: 0o600 });
+    message = `${guardFor(agent)}\n${AGENT_RULE(agent)}\n\nThe complete task is in the attached file task.md. Read it first and follow it exactly.`;
   }
-  args.push(message);
   const timeoutMin = num(a.timeout_minutes, DEFAULT_TIMEOUT_MIN, 1, 1440), timeoutMs = timeoutMin * TIMEOUT_UNIT_MS;
-  const t = { id, status: 'running', started: Date.now(), text: '', errors: [], err: '', attempts: 0, timeoutMin, resume: prev?.sessionID, mode: det.mode, agent, tier, title: finalTitle, args, cwd, tmpdir: tmp, timeoutMs, failure: null };
-  tasks.set(id, t); prune();
-  launch(t);
+  const started = (lastStart = Math.max(Date.now(), lastStart + 1)); // strictly increasing: the order of tasks is the order of starting
+  const t = { v: 1, id, status: 'running', started, deadline: started + timeoutMs, timeoutMin, timeoutMs, mode: det.mode, agent, tier, title: finalTitle, cwd, model, backend, head, message, attachDir, attachFile, resumeSession: prevSession, maxRetries: MAX_RETRIES, retryDelayMs: RETRY_DELAY_MS, attempt: 0, failure: null, bridge: pidRef(process.pid), mechanical: a.mechanical === true || a.mechanical === 'true', lane: str(a.lane) || null, ...(resume ? { resumeOf: resume.of } : {}) };
+  mkdirSync(tdir(id), { recursive: true, mode: 0o700 });
+  writeFileSync(join(tdir(id), 'prompt.md'), resume ? resume.userPrompt : prompt, { mode: 0o600 });
+  writeTask(t);
+  spawnRunner(t);
   const hint = det.mode === 'blueprint' && EDITORS.has(agent) ? ' Blueprint mode: make sure the prompt is a written Blueprint (files, signatures, acceptance criteria, test command).' : det.mode === 'insensitive' ? ' Insensitive mode: prefer parallel lanes (several tasks at once).' : '';
-  const lim = `Limits: ${runningTasks().length}/${MAX_PARALLEL} parallel, timeout ${timeoutMin} min${READ_ONLY.has(agent) ? `, up to ${MAX_RETRIES} automatic retries of transient provider errors` : ', no automatic retry (editing agent)'}${tmp ? `, prompt ${Math.round(Buffer.byteLength(full) / 1024)} KB sent as an attached file` : ''}.`;
-  return `task ${id} started | mode=${det.mode} (${det.source}) agent=${agent} tier=${tier} | title: ${finalTitle}\nNext: opencode_status / opencode_result (or opencode_session_output on the session id). ${lim} ${VERIFY_RULE}${hint}`;
+  const lim = `Limits: ${running.length + 1}/${MAX_PARALLEL} parallel, timeout ${timeoutMin} min${READ_ONLY.has(agent) ? `, up to ${MAX_RETRIES} automatic retries of transient provider errors` : ', no automatic retry (editing agent)'}${attachFile ? `, prompt ${Math.round(Buffer.byteLength(full) / 1024)} KB sent as an attached file` : ''}.`;
+  return { id, text: `task ${id} started | mode=${det.mode} (${det.source}) agent=${agent} tier=${tier} | title: ${finalTitle}\nNext: opencode_status / opencode_result with wait_s (up to ${MAX_WAIT_S} s per call), or opencode_session_output on the session id. The run is detached: it survives a restart of this bridge or of Claude Code (state in ${STATE_DIR}). ${lim} ${VERIFY_RULE}${hint}` };
+}
+function spawnRunner(t) {
+  const dir = tdir(t.id); const lf = openSync(join(dir, 'runner.log'), 'a', 0o600);
+  let p; try { p = spawn(RUNNER_CMD[0], [...RUNNER_CMD.slice(1), '--runner', dir], { detached: true, stdio: ['ignore', lf, lf], env: process.env, cwd: dir }); } catch (e) { closeSync(lf); return failStart(t, e); }
+  closeSync(lf);
+  p.on('error', (e) => failStart(t, e)); p.unref();
+  if (p.pid) atomicWrite(join(dir, 'runner.json'), JSON.stringify(pidRef(p.pid)));
+}
+function failStart(t, e) { try { writeTask({ ...(readTask(t.id) || t), status: 'failed', failure: spawnFailure(e), ended: Date.now() }); } catch {} }
+
+async function cancelTask(id) {
+  let s = await snap(id); const t = s.t;
+  if (isFinal(s.status)) return `task already ${s.status}; nothing to cancel`;
+  if (existsSync(join(tdir(id), 'cancelled'))) return 'task already cancelled; nothing to cancel';
+  ensureState(); writeFileSync(join(tdir(id), 'cancelled'), String(Date.now())); // first: no retry, no overwrite of the final state
+  const sid = t.sessionID || s.ev.sessionID; const notes = [];
+  if (sid) markCancelledSession(sid);
+  if (t.backend === 'service' && sid && pidAlive(t.child)) { try { const r = await api('POST', `/api/session/${encodeURIComponent(sid)}/interrupt`); notes.push(r.interrupted ? `session ${sid} interrupted through the service` : `the service reported no active execution for ${sid}`); } catch (e) { notes.push(`service interrupt failed (${clip(e.message, 120)}); the client process was stopped instead`); } }
+  killRef(t.child, 'SIGTERM'); const h = setTimeout(() => killRef(t.child, 'SIGKILL'), KILL_GRACE_MS); h.unref?.();
+  if (pidAlive(t.runner)) { try { process.kill(t.runner.pid, 'SIGTERM'); } catch {} }
+  else { try { writeTask({ ...readTask(id), status: 'cancelled', failure: null, ended: Date.now(), retryAt: null }); } catch {} }
+  return ['cancelled', ...notes].join('\n');
+}
+async function cancelSession(sid) { // a session no bridge task owns: through the service's abort endpoint
+  const r = await api('POST', `/api/session/${encodeURIComponent(sid)}/interrupt`);
+  if (!r.interrupted) return `session ${sid}: the service has no active execution to interrupt (it is idle or finished, or it is a --standalone run owned by its own client process: opencode_processes shows that pid; stop it with a pid-specific kill)`;
+  markCancelledSession(sid);
+  let st = ''; for (let i = 0; i < 8 && !st; i++) { await sleepMs(250); try { const s = (await api('GET', `/api/session/${encodeURIComponent(sid)}`)).data; if (s?.outcome) st = s.outcome; } catch {} }
+  return `cancelled: session ${sid} interrupted through the service (service outcome: ${st || 'pending'}; the bridge lists it as cancelled)`;
+}
+async function cancel(a) {
+  const id = String(a.id ?? '').trim();
+  if (/^ses_[A-Za-z0-9]+$/.test(id)) { const own = registry().find((t) => t.sessionID === id && !isFinal(t.status)); return own ? cancelTask(own.id) : cancelSession(id); }
+  return cancelTask(id);
 }
 
-function cancel(t) {
-  if (!live(t)) return `task already ${t.status}; nothing to cancel`;
-  const wasRetrying = t.status === 'retrying';
-  clearTimers(t); t.status = 'cancelled'; t.ended = Date.now();
-  if (!wasRetrying) { killGroup(t, 'SIGTERM'); t.killTimer = setTimeout(() => killGroup(t, 'SIGKILL'), KILL_GRACE_MS); } else cleanupTmp(t);
-  return 'cancelled';
+// opencode_resume: a new task from an interrupted / failed / lost one, with the original prompt and the progress so far
+async function resume(a) {
+  const s = await snap(String(a.id ?? '')); const t = s.t;
+  if (!isFinal(s.status)) throw new Error(`task ${t.id} is still ${s.status}; nothing to resume (opencode_status / opencode_result show its progress)`);
+  if (s.status === 'done') throw new Error(`task ${t.id} finished successfully; read it with opencode_result (to run it again, use opencode_start)`);
+  const editing = !READ_ONLY.has(t.agent);
+  const tree = editing ? gitStatus(t.cwd) : '';
+  if (editing && !(a.acknowledge_edits === true || a.acknowledge_edits === 'true')) throw new Error(`task ${t.id} used the EDITING agent "${t.agent}": it may have changed files before it stopped, and replaying it blindly can duplicate or clash with those changes. Working tree of ${t.cwd} right now (git status --short):\n${tree}\nInspect it (git diff), then call opencode_resume again with acknowledge_edits:true; the new run is told to inspect the tree first. Or finish the work yourself.`);
+  const original = readFileSync(join(tdir(t.id), 'prompt.md'), 'utf8');
+  const partial = s.text ? s.text.slice(-6000) : '';
+  const tools = s.ev.tools.map((x) => `${x.name}(${x.input}) [${x.status}]`).join('\n  ');
+  const ctx = [`RESUME: an earlier run of this task (id ${t.id}${t.sessionID ? ', session ' + t.sessionID : ''}) ended as "${s.status}"${t.failure ? ': ' + t.failure.message : ''}. Continue from where it stopped; do not redo finished work.`,
+    partial ? `Output of the earlier run (last part):\n${partial}` : 'The earlier run produced no output.', tools ? `Its last steps:\n  ${tools}` : '',
+    editing ? 'The working tree may contain PARTIAL EDITS of the earlier run. Run `git status` and `git diff` first, keep what is correct, finish the rest.' : '',
+    a.note ? `Extra instruction: ${String(a.note).slice(0, 2000)}` : ''].filter(Boolean).join('\n\n');
+  const sameSession = a.same_session === true || a.same_session === 'true';
+  const r = start({ prompt: sameSession ? `${ctx}\n\nContinue and finish the task.` : `${original}\n\n---\n${ctx}`, tier: t.tier, agent: t.agent, mechanical: t.mechanical, cwd: t.cwd, model: t.model || undefined, lane: t.lane || undefined, title: t.title.replace(/( \(resume\))*$/, ' (resume)'), mode: t.mode, timeout_minutes: a.timeout_minutes ?? t.timeoutMin, session: sameSession ? (t.sessionID || s.ev.sessionID) : undefined }, { resume: { of: t.id, userPrompt: original } });
+  return `${r.text}\nResumed task ${t.id} (${s.status}) as ${r.id} ${sameSession ? 'in the same session' : 'in a new session with the original prompt plus the progress so far'}.${editing ? `\nWorking tree at the time of the resume (git status --short):\n${tree}` : ''}`;
 }
 
 function policy({ cwd = ROOT, mode } = {}) {
@@ -316,27 +545,53 @@ function policy({ cwd = ROOT, mode } = {}) {
   return [`ACTIVE MODE: ${det.mode.toUpperCase()}  (source: ${det.source}${det.all.length > 1 ? '; also seen: ' + det.all.map((f) => `${f.mode} via ${f.src}`).join(', ') : ''})`,
     `directory evaluated: ${realpathSync(cwd)}`, '', MODE_RULES[det.mode], '', `Agents allowed here: ${allowed.join(', ')}`, '', 'TIERS: ' + TIER_RULE, '', 'VERIFY: ' + VERIFY_RULE, '',
     'ROSTER:\n' + Object.entries(ROSTER).map(([k, v]) => `  ${k.padEnd(14)} ${v}`).join('\n'), '',
-    `LIMITS: ${MAX_PARALLEL} parallel tasks, timeout ${DEFAULT_TIMEOUT_MIN} min, ${MAX_RETRIES} automatic retries (read-only agents, transient errors only), tool output capped at ${RESPONSE_CAP} characters. Error kinds and advice: see opencode_result.`, '',
+    `LIMITS: ${MAX_PARALLEL} parallel tasks, timeout ${DEFAULT_TIMEOUT_MIN} min, ${MAX_RETRIES} automatic retries (read-only agents, transient errors only), waits of at most ${MAX_WAIT_S} s per call, tool output capped at ${RESPONSE_CAP} characters. Error kinds and advice: see opencode_result.`, '',
     'Detection order (SENSITIVE wins): env OPENCODE_BRIDGE_MODE / OPENCODE_MODE; <project>/.claude/sensitive; <project>/.claude/insensitive; ~/.claude/insensitive and $CLAUDE_CONFIG_DIR/insensitive; the `mode` argument when the user asked. Default: blueprint.',
     'Roster agents are defined in https://github.com/Subhajit-Roy-Partho/opencode-config/tree/v2 (install it as ~/.config/opencode). Policy text: "OpenCode Specialist Delegation" in CLAUDE.md.'].join('\n');
 }
 
-const get = (id) => { const t = tasks.get(String(id ?? '')); if (!t) throw new Error('unknown task (opencode_list shows this bridge\'s tasks; for any other session use opencode_sessions)'); return t; };
-const el = (t) => Math.round(((t.ended ?? Date.now()) - t.started) / 1000);
-const statusText = (t) => `${t.status}${t.failure ? ` (${t.failure.kind})` : ''}${t.status === 'retrying' ? ` in ${Math.max(0, Math.round((t.retryAt - Date.now()) / 1000))}s` : ''} (${el(t)}s, ${t.text.length} chars${t.sessionID ? ', session ' + t.sessionID : ''}${t.attempts > 1 ? `, attempt ${t.attempts}` : ''}) ${t.agent}/${t.tier}/${t.mode}${t.status === 'done' && t.errors.length ? ` [${t.errors.length} error event(s) during the run]` : ''}`;
-function resultText(t, a) {
-  const lines = [`[${t.status}${t.failure ? ': ' + t.failure.kind : ''}]`];
+// ----- status / result with bounded waits and progress -----
+const ageS = (ms) => (ms ? Math.max(0, Math.round((Date.now() - ms) / 1000)) : null);
+function progressLine(s) {
+  const { t, ev } = s; const bits = [`${elapsed(t)}s elapsed`];
+  if (ev.steps) bits.push(`${ev.steps} step(s)`);
+  if (ev.tokens.input || ev.tokens.output) bits.push(`${k(ev.tokens.input)}/${k(ev.tokens.output)} tok`);
+  const last = ev.tools[ev.tools.length - 1];
+  if (last) bits.push(`last tool ${last.name}(${clip(last.input, 60)})`);
+  if (ev.lastAt) bits.push(`last output ${ageS(ev.lastAt)}s ago`);
+  if (s.text) bits.push(`${s.text.length} chars of text`);
+  return bits.join(', ');
+}
+function staleNote(s) { const q = s.ev.lastAt ? (Date.now() - s.ev.lastAt) / 60000 : 0; return !isFinal(s.status) && q > STALE_MIN ? ` [stale?: no output for ${Math.round(q)} min]` : ''; }
+function statusText(s) {
+  const { t } = s;
+  return `${s.status}${t.failure ? ` (${t.failure.kind})` : ''}${s.status === 'retrying' ? ` in ${Math.max(0, Math.round((t.retryAt - Date.now()) / 1000))}s` : ''} (${elapsed(t)}s, ${s.text.length} chars${t.sessionID || s.ev.sessionID ? ', session ' + (t.sessionID || s.ev.sessionID) : ''}${t.attempt > 1 ? `, attempt ${t.attempt}` : ''}) ${t.agent}/${t.tier}/${t.mode}${s.status === 'done' && s.ev.errors.length ? ` [${s.ev.errors.length} error event(s) during the run]` : ''}${staleNote(s)}${t.fallback ? ' [fallback: ' + t.fallback + ']' : ''}${s.note ? ` [${s.note}]` : ''}`;
+}
+function resultText(s, a) {
+  const { t } = s;
+  const lines = [`[${s.status}${t.failure ? ': ' + t.failure.kind : ''}]`];
   if (t.failure) { lines.push(t.failure.message); if (t.failure.advice) lines.push('Advice: ' + t.failure.advice); }
-  if (t.status === 'retrying') lines.push(`waiting ${Math.max(0, Math.round((t.retryAt - Date.now()) / 1000))}s before attempt ${t.attempts + 1} of ${MAX_RETRIES + 1}`);
-  if (!t.failure && t.errors.length) lines.push(`warning: ${t.errors.length} error event(s) during the run, first: ${clip(t.errors[0], 200)}`);
-  if (t.textTruncated) lines.push(`note: the output exceeded ${MAX_TEXT / 1e6} MB; only the last ${MAX_TEXT / 1e6} MB are kept`);
-  let body = t.text || (t.failure || t.status === 'cancelled' ? '' : '(no output yet)');
+  if (s.status === 'interrupted' || s.status === 'lost') lines.push(`recoverable: ${s.status === 'lost' ? 'no session exists, start the task again (opencode_resume re-sends the prompt)' : READ_ONLY.has(t.agent) ? `yes, read-only agent: opencode_resume id=${t.id}` : `partly: editing agent, check \`git status\` then opencode_resume id=${t.id} acknowledge_edits:true`}`);
+  if (t.fallback) lines.push(`fallback used: ${t.fallback}${t.fallbackNote ? ' (' + t.fallbackNote + ')' : ''}`);
+  if (s.status === 'retrying') lines.push(`waiting ${Math.max(0, Math.round((t.retryAt - Date.now()) / 1000))}s before attempt ${t.attempt + 1} of ${MAX_RETRIES + 1}`);
+  if (live(s)) { lines.push(`progress: ${progressLine(s)}${s.note ? ` [${s.note}]` : ''}${staleNote(s)}`); }
+  if (!t.failure && s.ev.errors.length) lines.push(`warning: ${s.ev.errors.length} error event(s) during the run, first: ${clip(s.ev.errors[0], 200)}`);
+  if (s.ev.textTruncated) lines.push(`note: the output exceeded ${MAX_TEXT / 1e6} MB; only the last ${MAX_TEXT / 1e6} MB are kept`);
+  let body = s.text || (t.failure || s.status === 'cancelled' ? '' : '(no output yet)');
   const tailN = num(a.tail, 0, 0, 5e7), headN = num(a.head, 0, 0, 5e7);
   if (tailN && body.length > tailN) body = body.slice(-tailN); else if (headN && body.length > headN) body = body.slice(0, headN);
   else if (!tailN && !headN && body.length > RESULT_CAP) { lines.push(`note: ${body.length - RESULT_CAP} earlier characters omitted (output is ${body.length}); pass head=N for the beginning or tail=N for a different size`); body = body.slice(-RESULT_CAP); }
   if (t.failure && body) lines.push('--- partial output ---');
   return lines.join('\n') + (body ? '\n' + body : '');
 }
+const waitArg = (a) => num(a.wait_s ?? a.timeout_s, 0, 0, MAX_WAIT_S);
+// Wait for a final state for at most `secs` (capped), sending MCP progress notifications through ctx.progress; returns the last snapshot.
+async function waitTask(id, secs, ctx = {}) {
+  const end = Date.now() + secs * 1000; let s = await snap(id);
+  while (secs > 0 && live(s) && Date.now() < end && !ctx.aborted) { await sleepMs(Math.min(WAIT_POLL_MS, Math.max(1, end - Date.now()))); s = await snap(id); ctx.progress?.(`${s.status}: ${progressLine(s)}`); }
+  return s;
+}
+const stillRunning = (s, secs) => `[still_running] task ${s.t.id} is ${s.status} after waiting ${secs} s; this is normal for a long job and nothing is lost.\nprogress: ${progressLine(s)}${s.note ? ` [${s.note}]` : ''}${staleNote(s)}\nNext: poll again with opencode_result id=${s.t.id} wait_s=${MAX_WAIT_S} (about every ${MAX_WAIT_S} s)${s.t.sessionID || s.ev.sessionID ? `, or read the steps with opencode_session_output id=${s.t.sessionID || s.ev.sessionID} mode=tail` : ''}.`;
 
 // ---------- session visibility (v0.2) ----------
 // All calls go through `opencode api`, which knows how to reach and authenticate to the background service.
@@ -375,7 +630,7 @@ const k = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.rou
 const tail = (p, n = 2) => String(p || '').split('/').filter(Boolean).slice(-n).join('/');
 
 function stateOf(s, activeIds) {
-  if (s.outcome) return s.outcome;
+  if (s.outcome) return s.outcome === 'interrupted' && isCancelledSession(s.id) ? 'cancelled' : s.outcome; // an interrupt that the bridge asked for is "cancelled", not a crash
   if (activeIds.has(s.id)) return 'running';
   const upd = s.time?.updated ?? s.time?.created ?? 0;
   return (Date.now() - upd) / 60000 > STALE_MIN ? 'stale?' : 'running';
@@ -468,7 +723,8 @@ async function sessionOutput(a) {
   const st = stateOf(s, act);
   const failRaw = (mr.data ?? []).map((m) => m.error).find(Boolean);
   const failure = failRaw ? (() => { const msg = errText(failRaw); const c = classify(msg); return `\nfailure: ${c.kind}: ${clip(msg, 300)}${c.advice ? '\nadvice: ' + c.advice : ''}`; })() : '';
-  const head = `${s.id}  ${st}  ${s.agent}  updated ${ago(s.time?.updated ?? s.time?.created ?? 0)} ago  ${k(s.tokens?.input)}/${k(s.tokens?.output)} tok\n${tail(s.location?.directory, 4)}  |  ${s.title}${failure}`;
+  const why = st === 'interrupted' ? '\nnote: interrupted = stopped before it finished (its client or the opencode service was stopped or restarted, or someone interrupted it); this is not a provider failure and the work so far is below. A read-only run can be continued (opencode_resume on its bridge task, or a new task with this output); for an editing run check git status first.' : st === 'cancelled' ? '\nnote: cancelled through the bridge (opencode_cancel); the service records it as interrupted.' : '';
+  const head = `${s.id}  ${st}  ${s.agent}  updated ${ago(s.time?.updated ?? s.time?.created ?? 0)} ago  ${k(s.tokens?.input)}/${k(s.tokens?.output)} tok\n${tail(s.location?.directory, 4)}  |  ${s.title}${failure}${why}`;
   let body;
   if (mode === 'last') {
     let last = '';
@@ -524,15 +780,15 @@ function processes() {
   });
 }
 
-const capResponse = (t) => { t = String(t ?? ''); return t.length <= RESPONSE_CAP ? t : t.slice(0, Math.floor(RESPONSE_CAP * 0.6)) + `\n…[${t.length - RESPONSE_CAP} characters omitted to stay within the tool-output limit; narrow the request]…\n` + t.slice(-Math.floor(RESPONSE_CAP * 0.4)); };
-async function call(name, a) {
+async function call(name, a, ctx = {}) {
   switch (name) {
-    case 'opencode_start': return start(a);
+    case 'opencode_start': { ensureState(); const r = start(a); const w = waitArg(a); if (!w) return r.text; const s = await waitTask(r.id, w, ctx); return live(s) ? `${r.text}\n${stillRunning(s, w)}` : `${r.text}\n${statusText(s)}\n${resultText(s, {})}`; }
     case 'opencode_policy': return policy(a);
-    case 'opencode_status': return statusText(get(a.id));
-    case 'opencode_result': return resultText(get(a.id), a);
-    case 'opencode_cancel': return cancel(get(a.id));
-    case 'opencode_list': return [...tasks.values()].map((t) => `${t.id} ${t.status}${t.failure ? ':' + t.failure.kind : ''} ${el(t)}s${t.sessionID ? ' ' + t.sessionID : ''} ${t.agent}/${t.tier}/${t.mode} ${clip(t.title, 60)}`).join('\n') || 'none';
+    case 'opencode_status': { const w = waitArg(a); const s = await waitTask(String(a.id ?? ''), w, ctx); return statusText(s); }
+    case 'opencode_result': { const w = waitArg(a); const s = await waitTask(String(a.id ?? ''), w, ctx); return w && live(s) ? stillRunning(s, w) : resultText(s, a); }
+    case 'opencode_cancel': return cancel(a);
+    case 'opencode_resume': return resume(a);
+    case 'opencode_list': return listTasks(a);
     case 'opencode_sessions': return sessions(a);
     case 'opencode_session_output': return sessionOutput(a);
     case 'opencode_session_rename': return rename(a);
@@ -540,31 +796,60 @@ async function call(name, a) {
     default: throw new Error('unknown tool');
   }
 }
+function listTasks(a) {
+  const want = String(a.state || '').toLowerCase(); const limit = num(a.limit, 50, 1, 500);
+  const rows = registry().filter((t) => { try { return inside(t.cwd); } catch { return false; } }).filter((t) => !want || t.status === want).sort((x, y) => x.started - y.started).slice(-limit);
+  return rows.map((t) => `${t.id} ${t.status}${t.failure ? ':' + t.failure.kind : ''} ${elapsed(t)}s${t.sessionID ? ' ' + t.sessionID : ''} ${t.agent}/${t.tier}/${t.mode} ${clip(t.title, 60)}${t.bridge?.pid !== process.pid ? ' [earlier bridge instance]' : ''}`).join('\n') || 'none';
+}
+// housekeeping at start-up: drop old finished task directories (and the attachments of tasks that died)
+function pruneState() {
+  const now = Date.now(); const fin = registry().filter((t) => isFinal(t.status)).sort((x, y) => (x.ended ?? x.started) - (y.ended ?? y.started));
+  const drop = new Set(fin.filter((t) => now - (t.ended ?? t.started) > KEEP_DAYS * 86400000).map((t) => t.id)); for (const t of fin.slice(0, Math.max(0, fin.length - KEEP_FINISHED))) drop.add(t.id);
+  for (const id of drop) { try { const a = readTask(id)?.attachDir; if (a) rmSync(a, { recursive: true, force: true }); rmSync(tdir(id), { recursive: true, force: true }); } catch {} }
+  try { for (const f of readdirSync(CANCEL_DIR)) { try { if (now - Number(readFileSync(join(CANCEL_DIR, f), 'utf8')) > KEEP_DAYS * 86400000) rmSync(join(CANCEL_DIR, f)); } catch {} } } catch {}
+}
+// Safety net of the bridge: tasks whose supervisor (runner) is gone get their deadline enforced and their final state reconciled with the service.
+async function supervise() { for (const t of registry()) { if (isFinal(t.status)) continue; if (pidAlive(t.runner)) continue; try { await snap(t.id); } catch {} } }
+
+const capResponse = (t) => { t = String(t ?? ''); return t.length <= RESPONSE_CAP ? t : t.slice(0, Math.floor(RESPONSE_CAP * 0.6)) + `\n…[${t.length - RESPONSE_CAP} characters omitted to stay within the tool-output limit; narrow the request]…\n` + t.slice(-Math.floor(RESPONSE_CAP * 0.4)); };
+// no tool call may block longer than the budget: a client-side tool timeout must never be the first to fire
+const withBudget = (p, ms, name) => new Promise((resolve, reject) => { const h = setTimeout(() => { reject(new Error(`${name} did not finish within the bridge's ${Math.round(ms / 100) / 10} s budget (the opencode service or a lookup is slow). Nothing is lost: running tasks continue in the background; retry in a few seconds${/start|cancel|resume/.test(name) ? ' (check opencode_list first: the action may have been performed)' : ''}.`)); }, ms); h.unref?.(); p.then((v) => { clearTimeout(h); resolve(v); }, (e) => { clearTimeout(h); reject(e); }); });
 
 // Run the stdio server only when started directly (`node server.mjs`); importing the file (rust/tools/dump_texts.mjs) just exposes the texts.
 const isMain = (() => { try { return realpathSync(process.argv[1]) === realpathSync(new URL(import.meta.url).pathname); } catch { return false; } })();
 export const __shared = { AGENT_RULE, tools, INSTRUCTIONS, MODE_RULES, TIER_RULE, VERIFY_RULE, ROSTER, KINDS, SECRET_RES, GUARD, GUARD_LANES, READ_ONLY, EDITORS, STALE_MIN };
 
-if (isMain) {
+if (isMain && process.argv[2] === '--runner') await runner(process.argv[3]); // detached supervisor of one task (never returns)
+else if (isMain) {
 // ---------- protocol loop, shutdown, last-resort guards ----------
 const send = (m) => { try { process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...m }) + '\n'); } catch {} };
 let closing = false;
-function shutdown(code = 0) { // the client went away (or we were told to stop): no orphaned opencode processes or temp files
+function shutdown(code = 0) {
+  // The client went away (Claude Code exited or restarted) or we were told to stop. Tasks are DETACHED and keep running (their
+  // state is on disk; the next bridge instance picks them up). Only OPENCODE_BRIDGE_KILL_ON_EXIT=1 restores the old behaviour.
   if (closing) return; closing = true;
-  for (const t of tasks.values()) { clearTimers(t); if (live(t)) killGroup(t, 'SIGTERM'); }
-  setTimeout(() => { for (const t of tasks.values()) { killGroup(t, 'SIGKILL'); cleanupTmp(t); } process.exit(code); }, 300);
+  if (KILL_ON_EXIT) for (const t of registry()) { if (isFinal(t.status) || t.bridge?.pid !== process.pid) continue; try { writeFileSync(join(tdir(t.id), 'cancelled'), String(Date.now())); if (pidAlive(t.runner)) process.kill(t.runner.pid, 'SIGTERM'); } catch {} }
+  setTimeout(() => process.exit(code), KILL_ON_EXIT ? 400 : 50);
 }
+const inflight = new Map(); // request id -> { aborted, progress }
 const rl = createInterface({ input: process.stdin });
 rl.on('line', async (line) => {
   let m; try { m = JSON.parse(line); } catch { return; }
-  if (!m || typeof m !== 'object' || m.id === undefined || m.id === null) return; // notification or junk
+  if (!m || typeof m !== 'object') return;
+  if (m.method === 'notifications/cancelled') { const c = inflight.get(m.params?.requestId); if (c) c.aborted = true; return; } // the client gave up on a call: stop waiting for it
+  if (m.id === undefined || m.id === null) return; // notification or junk
   try {
     if (m.method === 'initialize') send({ id: m.id, result: { protocolVersion: m.params?.protocolVersion ?? '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'opencode-bridge', version: VERSION }, instructions: INSTRUCTIONS } });
     else if (m.method === 'tools/list') send({ id: m.id, result: { tools } });
     else if (m.method === 'tools/call') {
-      const args = m.params?.arguments;
-      try { send({ id: m.id, result: { content: [{ type: 'text', text: capResponse(await call(String(m.params?.name ?? ''), args && typeof args === 'object' && !Array.isArray(args) ? args : {})) }] } }); }
+      const args = m.params?.arguments; const name = String(m.params?.name ?? '');
+      const ctx = { aborted: false, progress: null }; inflight.set(m.id, ctx);
+      // keepalive: calls that carry a progressToken get MCP progress notifications while they run, so the client does not time them out
+      const tok = m.params?._meta?.progressToken; let hb = null, n = 0, msg = 'working';
+      if (tok !== undefined && tok !== null) { ctx.progress = (x) => { msg = x; }; hb = setInterval(() => send({ method: 'notifications/progress', params: { progressToken: tok, progress: ++n, message: String(msg).slice(0, 300) } }), PROGRESS_MS); }
+      try { send({ id: m.id, result: { content: [{ type: 'text', text: capResponse(await withBudget(call(name, args && typeof args === 'object' && !Array.isArray(args) ? args : {}, ctx), CALL_BUDGET_MS, name)) }] } }); }
       catch (e) { send({ id: m.id, result: { isError: true, content: [{ type: 'text', text: capResponse(e?.message ?? e) }] } }); }
+      finally { if (hb) clearInterval(hb); inflight.delete(m.id); }
     } else send({ id: m.id, result: {} });
   } catch (e) { send({ id: m.id, error: { code: -32603, message: String(e?.message ?? e) } }); }
 });
@@ -573,5 +858,6 @@ for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(sig, () => shutdow
 process.stdout.on('error', (e) => { if (e?.code === 'EPIPE') shutdown(0); });
 process.on('uncaughtException', (e) => { try { process.stderr.write(`opencode-bridge: uncaught ${e?.stack ?? e}\n`); } catch {} });
 process.on('unhandledRejection', (e) => { try { process.stderr.write(`opencode-bridge: unhandled rejection ${e?.stack ?? e}\n`); } catch {} });
-process.on('exit', () => tasks.forEach((t) => { if (live(t)) killGroup(t, 'SIGKILL'); cleanupTmp(t); }));
+try { pruneState(); } catch {}
+supervise().catch(() => {}); setInterval(() => supervise().catch(() => {}), 15000).unref();
 }

@@ -2,7 +2,7 @@
  "tools": [
   {
    "name": "opencode_start",
-   "description": "Delegate an EASY or MEDIUM job to an opencode agent (async; returns a task id). POLICY IS ENFORCED: `tier` is required and hard/unsure work is refused (it stays on Claude); the routing MODE (blueprint default | sensitive | insensitive; sensitive wins) is detected from env OPENCODE_MODE, <project>/.claude/sensitive|insensitive, ~/.claude/insensitive, or the `mode` argument, and limits the agents (sensitive: explorer, librarian, deep-research, oracle, and fixer/worker only with mechanical:true). Blueprint mode: give fixer/designer a written Blueprint (files, signatures, edge cases, acceptance criteria, test command). Prompts containing secrets are refused. The session is titled \"<LANE>/<agent>: <task>\". LIMITS: at most OPENCODE_BRIDGE_MAX_PARALLEL tasks at once (default 6), a per-task timeout, automatic retry (backoff) of transient provider errors for read-only agents only, prompts over ~100 KB are sent as an attached file. Verify the result yourself - it is an untrusted draft. Call opencode_policy for the full rules.",
+   "description": "Delegate an EASY or MEDIUM job to an opencode agent (async; returns a task id). POLICY IS ENFORCED: `tier` is required and hard/unsure work is refused (it stays on Claude); the routing MODE (blueprint default | sensitive | insensitive; sensitive wins) is detected from env OPENCODE_MODE, <project>/.claude/sensitive|insensitive, ~/.claude/insensitive, or the `mode` argument, and limits the agents (sensitive: explorer, librarian, deep-research, oracle, and fixer/worker only with mechanical:true). Blueprint mode: give fixer/designer a written Blueprint (files, signatures, edge cases, acceptance criteria, test command). Prompts containing secrets are refused. The session is titled \"<LANE>/<agent>: <task>\". The task runs DETACHED and is stored on disk: it survives a restart of this bridge or of Claude Code. LIMITS: at most OPENCODE_BRIDGE_MAX_PARALLEL tasks at once (default 6), a per-task timeout, automatic retry (backoff) of transient provider errors for read-only agents only, prompts over ~100 KB are sent as an attached file. Verify the result yourself - it is an untrusted draft. Call opencode_policy for the full rules.",
    "inputSchema": {
     "type": "object",
     "required": [
@@ -53,6 +53,10 @@
      "timeout_minutes": {
       "type": "number",
       "description": "wall-clock limit, default 1234 (1-1440); the process group is killed when it is reached"
+     },
+     "wait_s": {
+      "type": "number",
+      "description": "optional: wait up to this many seconds (cap 25) and return the outcome if the task finishes in time"
      }
     }
    }
@@ -76,7 +80,7 @@
   },
   {
    "name": "opencode_status",
-   "description": "Status of a task started by this bridge (running/done/failed), elapsed time and session id.",
+   "description": "Status of a task started by this bridge or by an earlier instance of it (running / retrying / done / failed / timeout / cancelled / interrupted / lost), elapsed time and session id. Optional wait_s waits (bounded, at most 25 s) until the task finishes.",
    "inputSchema": {
     "type": "object",
     "required": [
@@ -85,13 +89,17 @@
     "properties": {
      "id": {
       "type": "string"
+     },
+     "wait_s": {
+      "type": "number",
+      "description": "wait up to this many seconds (cap 25) for the task to finish"
      }
     }
    }
   },
   {
    "name": "opencode_result",
-   "description": "Output of a task started by this bridge, with the failure kind and advice when it failed (rate_limit, quota, context_length, output_limit, overloaded, auth, model, agent, invalid_request, network, timeout, spawn, exit). Large outputs are cut to the last 60000 characters unless `head` / `tail` is given.",
+   "description": "Output of a task started by this bridge, with the failure kind and advice when it failed (rate_limit, quota, context_length, output_limit, overloaded, auth, model, agent, invalid_request, network, timeout, spawn, exit). interrupted (client or service stopped) is reported separately from failed, with advice. Large outputs are cut to the last 60000 characters unless `head` / `tail` is given. A running task answers with its progress; with wait_s (bounded, at most 25 s) the call waits for the outcome and otherwise returns [still_running] with progress and the next-poll hint.",
    "inputSchema": {
     "type": "object",
     "required": [
@@ -108,13 +116,17 @@
      "head": {
       "type": "number",
       "description": "only the first N characters"
+     },
+     "wait_s": {
+      "type": "number",
+      "description": "wait up to this many seconds (cap 25) for the task to finish"
      }
     }
    }
   },
   {
    "name": "opencode_cancel",
-   "description": "Cancel a running or retrying task started by this bridge: SIGTERM, then SIGKILL, to its whole process group (never touches other sessions). A finished task is reported as such.",
+   "description": "Cancel a running or retrying task started by this bridge: the opencode service is asked to interrupt its session (abort endpoint) and its client process group gets SIGTERM, then SIGKILL; the task and its session are then shown as cancelled, not interrupted. `id` may also be a session id (ses_...) that no bridge task owns: it is interrupted through the service (use only for sessions you started). A finished task is reported as such.",
    "inputSchema": {
     "type": "object",
     "required": [
@@ -122,28 +134,69 @@
     ],
     "properties": {
      "id": {
-      "type": "string"
+      "type": "string",
+      "description": "task id, or a session id (ses_...)"
+     }
+    }
+   }
+  },
+  {
+   "name": "opencode_resume",
+   "description": "Continue a task that ended as interrupted, lost, failed, timeout or cancelled: starts a new task with the original prompt plus the progress so far (partial output, last steps). READ-ONLY agents (explorer, librarian, deep-research, oracle) resume directly. EDITING agents (fixer, designer, worker, general) are refused until you pass acknowledge_edits:true: the reply shows `git status --short` of the working directory so you can see what the interrupted run changed first, and the new run is told to inspect the tree before editing. same_session:true continues the same opencode session instead of starting a new one.",
+   "inputSchema": {
+    "type": "object",
+    "required": [
+     "id"
+    ],
+    "properties": {
+     "id": {
+      "type": "string",
+      "description": "task id (opencode_list)"
+     },
+     "acknowledge_edits": {
+      "type": "boolean",
+      "description": "editing agents: confirm you looked at the working tree and want the work continued"
+     },
+     "same_session": {
+      "type": "boolean",
+      "description": "continue the same opencode session (shorter prompt) instead of a new one"
+     },
+     "note": {
+      "type": "string",
+      "description": "extra instruction for the continued run"
+     },
+     "timeout_minutes": {
+      "type": "number"
      }
     }
    }
   },
   {
    "name": "opencode_list",
-   "description": "List tasks started by this bridge. For ALL opencode sessions use opencode_sessions.",
+   "description": "List tasks started by this bridge and by earlier instances of it (persisted, newest 50 by default). For ALL opencode sessions use opencode_sessions.",
    "inputSchema": {
     "type": "object",
-    "properties": {}
+    "properties": {
+     "limit": {
+      "type": "number",
+      "description": "how many of the newest tasks (default 50, max 500)"
+     },
+     "state": {
+      "type": "string",
+      "description": "only this state, e.g. running | interrupted | failed | done"
+     }
+    }
    }
   },
   {
    "name": "opencode_sessions",
-   "description": "READ-ONLY. List opencode sessions of the background service across all projects (newest first): id, state (running / succeeded / failed / interrupted / stale?), agent, age, tokens, directory, title. Use state=running to see what is active now; a session whose last update is older than ~45 min and has no outcome is shown as \"stale?\".",
+   "description": "READ-ONLY. List opencode sessions of the background service across all projects (newest first): id, state (running / succeeded / failed / interrupted / cancelled / stale?), agent, age, tokens, directory, title. Use state=running to see what is active now; a session whose last update is older than ~45 min and has no outcome is shown as \"stale?\".",
    "inputSchema": {
     "type": "object",
     "properties": {
      "state": {
       "type": "string",
-      "description": "running (default: all) | active | finished | succeeded | failed | interrupted | stale | all"
+      "description": "running (default: all) | active | finished | succeeded | failed | interrupted | cancelled | stale | all"
      },
      "agent": {
       "type": "string",
@@ -236,7 +289,7 @@
    }
   }
  ],
- "instructions": "opencode-bridge: delegate easy/medium work to opencode (cheap model) and watch every opencode session. Routing policy is enforced by the tools, not optional.\n\nMODES (call opencode_policy to see which is active for a directory; SENSITIVE wins): BLUEPRINT (default): offload easy + medium work. Recon/docs first (explorer + librarian in parallel), then write a compact Blueprint (target files, signatures, edge cases, acceptance criteria, test command), send it to fixer (designer for UI), optionally have oracle grade git diff + tests, then verify yourself (read output, spot-check git diff, rerun the tests). | SENSITIVE (conservative, quality-critical): delegate ONLY explorer, librarian, deep-research, oracle, and fixer strictly for mechanical boilerplate / text replacement (pass mechanical:true). All moderate and complex implementation, bugfixes and architecture stay on Claude. | INSENSITIVE (aggressive offload, Claude is manager): delegate all easy + medium executable work - recon, docs/research, implementation against a blueprint, edits, installs, build/test loops, verification runs, mechanical changes; prefer parallel lanes (explorer + librarian, per-area fixer lanes). Hard / moderately hard still stay on Claude.\n\nTIERS: Delegate EASY and MEDIUM only (literature search, quote extraction, DOI lookups, bulk download/parse/convert/clean, table collation, boilerplate and glue scripts, functions with a given formula, unit tests, README drafts, plots from given tables, mechanical refactors, UI against a written blueprint). Keep HARD and MODERATELY HARD on Claude: experiment / protocol design, split and leakage decisions, anything touching sealed or held-out data, model/objective/feature design, statistics and every reported number, scoring / metric / dataset-join / split / energy-function code, non-obvious debugging, architecture, interpretation. Rule of thumb: if a silent mistake would change a reported number, a conclusion, a data split, or damage data, do not delegate. If unsure, treat the job as one tier harder (tier \"unsure\" is refused).\n\nWORKFLOW: opencode_start needs tier (easy|medium) and agent (explorer|librarian|deep-research|oracle|fixer|designer|general|worker); then poll opencode_status / opencode_result; see all sessions with opencode_sessions (state=running for what is active now) and read one with opencode_session_output. Treat the output as an untrusted draft: check files exist, rerun the tests yourself, recompute every reported number from raw outputs, inspect git diff, spot-check >=10% of literature claims (quote in the text, DOI resolves). Never hand it secrets or credentials; do not let it push, publish, delete, or touch other repositories unless the task says so. A delegated job that fails twice is taken over by Claude.\n\nLIMITS AND ERRORS: at most OPENCODE_BRIDGE_MAX_PARALLEL tasks run at once (default 6) and each has a timeout (default 120 min, process group killed). Failures are classified in opencode_result (rate_limit, quota, context_length, output_limit, overloaded, auth, model, agent, invalid_request, network, timeout, spawn, exit) with advice. Only TRANSIENT errors (rate_limit, overloaded, network) of READ-ONLY agents that produced no output are retried automatically with backoff; an editing agent is never replayed. quota / auth / context_length / invalid_request are not retried: switch model, split the task, or keep the work on Claude. Prompts over ~100 KB are attached as a file.\n\nNAMING: every session title is \"<LANE>/<agent>: <task>\" (e.g. ALPHA/deep-research: collect API notes); opencode_start sets it, opencode_session_rename fixes old ones. The agent roster (explorer, librarian, deep-research, oracle, fixer, designer, general) comes from the opencode-config repository (https://github.com/Subhajit-Roy-Partho/opencode-config/tree/v2); without it only the built-in \"worker\" agent exists.",
+ "instructions": "opencode-bridge: delegate easy/medium work to opencode (cheap model) and watch every opencode session. Routing policy is enforced by the tools, not optional.\n\nMODES (call opencode_policy to see which is active for a directory; SENSITIVE wins): BLUEPRINT (default): offload easy + medium work. Recon/docs first (explorer + librarian in parallel), then write a compact Blueprint (target files, signatures, edge cases, acceptance criteria, test command), send it to fixer (designer for UI), optionally have oracle grade git diff + tests, then verify yourself (read output, spot-check git diff, rerun the tests). | SENSITIVE (conservative, quality-critical): delegate ONLY explorer, librarian, deep-research, oracle, and fixer strictly for mechanical boilerplate / text replacement (pass mechanical:true). All moderate and complex implementation, bugfixes and architecture stay on Claude. | INSENSITIVE (aggressive offload, Claude is manager): delegate all easy + medium executable work - recon, docs/research, implementation against a blueprint, edits, installs, build/test loops, verification runs, mechanical changes; prefer parallel lanes (explorer + librarian, per-area fixer lanes). Hard / moderately hard still stay on Claude.\n\nTIERS: Delegate EASY and MEDIUM only (literature search, quote extraction, DOI lookups, bulk download/parse/convert/clean, table collation, boilerplate and glue scripts, functions with a given formula, unit tests, README drafts, plots from given tables, mechanical refactors, UI against a written blueprint). Keep HARD and MODERATELY HARD on Claude: experiment / protocol design, split and leakage decisions, anything touching sealed or held-out data, model/objective/feature design, statistics and every reported number, scoring / metric / dataset-join / split / energy-function code, non-obvious debugging, architecture, interpretation. Rule of thumb: if a silent mistake would change a reported number, a conclusion, a data split, or damage data, do not delegate. If unsure, treat the job as one tier harder (tier \"unsure\" is refused).\n\nWORKFLOW: opencode_start needs tier (easy|medium) and agent (explorer|librarian|deep-research|oracle|fixer|designer|general|worker); then poll opencode_status / opencode_result with wait_s (a bounded wait, at most 25 s per call; a long job answers still_running with its progress, poll again); see all sessions with opencode_sessions (state=running for what is active now) and read one with opencode_session_output. Treat the output as an untrusted draft: check files exist, rerun the tests yourself, recompute every reported number from raw outputs, inspect git diff, spot-check >=10% of literature claims (quote in the text, DOI resolves). Never hand it secrets or credentials; do not let it push, publish, delete, or touch other repositories unless the task says so. A delegated job that fails twice is taken over by Claude.\n\nLIMITS AND ERRORS: at most OPENCODE_BRIDGE_MAX_PARALLEL tasks run at once (default 6) and each has a timeout (default 120 min, process group killed). Failures are classified in opencode_result (rate_limit, quota, context_length, output_limit, overloaded, auth, model, agent, step_limit, invalid_request, network, timeout, spawn, exit) with advice; interrupted and lost are separate outcomes, not failures. Only TRANSIENT errors (rate_limit, overloaded, network) of READ-ONLY agents that produced no output are retried automatically with backoff; an editing agent is never replayed. quota / auth / context_length / invalid_request are not retried: switch model, split the task, or keep the work on Claude. Prompts over ~100 KB are attached as a file.\n\nRESTARTS AND TIMEOUTS: tasks run detached and are stored in a state directory, so they survive a restart of this bridge or of Claude Code; after a restart opencode_list / opencode_status / opencode_result still work for them. No call blocks longer than ~28 s (wait_s is capped at 25 s). A task that ended as interrupted (client or service stopped) can be continued with opencode_resume (read-only agents directly; editing agents only with acknowledge_edits after you looked at git status). opencode_cancel also accepts a session id and cancels it through the opencode service.\n\nNAMING: every session title is \"<LANE>/<agent>: <task>\" (e.g. ALPHA/deep-research: collect API notes); opencode_start sets it, opencode_session_rename fixes old ones. The agent roster (explorer, librarian, deep-research, oracle, fixer, designer, general) comes from the opencode-config repository (https://github.com/Subhajit-Roy-Partho/opencode-config/tree/v2); without it only the built-in \"worker\" agent exists.",
  "modeRules": {
   "blueprint": "BLUEPRINT (default): offload easy + medium work. Recon/docs first (explorer + librarian in parallel), then write a compact Blueprint (target files, signatures, edge cases, acceptance criteria, test command), send it to fixer (designer for UI), optionally have oracle grade git diff + tests, then verify yourself (read output, spot-check git diff, rerun the tests).",
   "sensitive": "SENSITIVE (conservative, quality-critical): delegate ONLY explorer, librarian, deep-research, oracle, and fixer strictly for mechanical boilerplate / text replacement (pass mechanical:true). All moderate and complex implementation, bugfixes and architecture stay on Claude.",
@@ -310,6 +363,13 @@
    "provider\\.no-route|model (is )?(unavailable|not found)|unknown model|no such model",
    "i",
    "Model unavailable. Check OPENCODE_BRIDGE_MODEL / the `model` argument (`opencode models` lists valid ids)."
+  ],
+  [
+   "step_limit",
+   false,
+   "tool_choice",
+   "i",
+   "The provider rejected a forced `tool_choice`. This is what happens when an agent reaches its `steps` limit: opencode then forces a final answer, and a provider that only accepts \"auto\" fails the request (docs/ERRORS.md). Read-only agents are asked automatically, once, to write their report in the same session; otherwise use opencode_resume, or remove / raise `steps` of that agent in opencode.jsonc."
   ],
   [
    "invalid_request",

@@ -45,7 +45,7 @@ pub fn processes() -> Result<String, String> {
         } else { String::new() };
         let cwd = if procfs { std::fs::canonicalize(format!("/proc/{}/cwd", pid)).map(|p| p.to_string_lossy().to_string()).unwrap_or_default() } else { String::new() };
         let shown = if !title.is_empty() { title } else { let m = clip(&message, 80); if m.is_empty() { "(interactive)".to_string() } else { m } };
-        rows.push(format!("{}  {}  {} {} {} {}", pad_start(pid, 8), pad_start(et, 10), pad_end(if sub.is_empty() { "TUI" } else { sub }, 4), pad_end(&agent, 13), pad_end(&tail_path(&cwd, 3), 34), shown));
+        rows.push(format!("{}  {}  {} {} {} {}", pad_start(pid, 8), pad_start(et, 10), pad_end(if sub.is_empty() { "TUI" } else { sub }, 4), pad_end(&agent, 13), pad_end(&tail_path(&cwd, 3), 30), shown));
     }
     if rows.is_empty() { return Ok("no opencode run / TUI processes".into()); }
     Ok(format!("pid        elapsed  kind agent         cwd                                title / task\n{}{}", rows.join("\n"),

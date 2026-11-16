@@ -1,7 +1,7 @@
 // Test helpers: an MCP stdio client for server.mjs, run against the fake `opencode` in test/bin.
 import { spawn, execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, readdirSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -39,7 +39,20 @@ export function startServer({ fake = true, env = {}, root } = {}) {
   const text = async (name, args = {}) => { const r = await call(name, args); return r.content?.[0]?.text ?? ''; };
   return { rpc, call, text, raw: (s) => child.stdin.write(s), notify: (method, params = {}) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n'),
     extra, get stderr() { return stderr; }, workdir, rootDir, child,
-    close() { child.stdin.end(); child.kill(); rmSync(workdir, { recursive: true, force: true }); } };
+    stateDir: e.OPENCODE_BRIDGE_STATE_DIR || join(workdir, 'home', '.local', 'state', 'opencode-bridge'),
+    // tasks are detached and outlive the bridge: close() stops this server and reaps every runner / opencode process it left behind
+    close() { child.stdin.end(); child.kill(); reapState(e.OPENCODE_BRIDGE_STATE_DIR || join(workdir, 'home', '.local', 'state', 'opencode-bridge')); rmSync(workdir, { recursive: true, force: true }); } };
+}
+
+/** Kill every runner and opencode client group recorded in a state directory (pid-specific). */
+export function reapState(stateDir) {
+  const tdir = join(stateDir, 'tasks'); let ids = []; try { ids = readdirSync(tdir); } catch { return; }
+  for (const id of ids) {
+    for (const f of ['runner.json', 'task.json']) {
+      let j; try { j = JSON.parse(readFileSync(join(tdir, id, f), 'utf8')); } catch { continue; }
+      for (const p of [f === 'runner.json' ? j : j.runner, j.child]) { if (p?.pid) { try { process.kill(-p.pid, 'SIGKILL'); } catch { try { process.kill(p.pid, 'SIGKILL'); } catch {} } } }
+    }
+  }
 }
 
 export const readLog = (file) => (existsSync(file) ? readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);

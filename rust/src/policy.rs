@@ -102,7 +102,7 @@ pub fn policy_text(args: &Value) -> Result<String, String> {
         format!("Agents allowed here: {}", allowed.join(", ")), String::new(),
         format!("TIERS: {}", txt("tierRule")), String::new(), format!("VERIFY: {}", txt("verifyRule")), String::new(),
         format!("ROSTER:\n{}", roster), String::new(),
-        format!("LIMITS: {} parallel tasks, timeout {} min, {} automatic retries (read-only agents, transient errors only), tool output capped at {} characters. Error kinds and advice: see opencode_result.", c.max_parallel, c.default_timeout_min, c.max_retries, RESPONSE_CAP), String::new(),
+        format!("LIMITS: {} parallel tasks, timeout {} min, {} automatic retries (read-only agents, transient errors only), waits of at most {} s per call, tool output capped at {} characters. Error kinds and advice: see opencode_result.", c.max_parallel, c.default_timeout_min, c.max_retries, c.max_wait_s, RESPONSE_CAP), String::new(),
         "Detection order (SENSITIVE wins): env OPENCODE_BRIDGE_MODE / OPENCODE_MODE; <project>/.claude/sensitive; <project>/.claude/insensitive; ~/.claude/insensitive and $CLAUDE_CONFIG_DIR/insensitive; the `mode` argument when the user asked. Default: blueprint.".to_string(),
         "Roster agents are defined in https://github.com/Subhajit-Roy-Partho/opencode-config/tree/v2 (install it as ~/.config/opencode). Policy text: \"OpenCode Specialist Delegation\" in CLAUDE.md.".to_string(),
     ];

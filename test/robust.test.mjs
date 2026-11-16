@@ -30,7 +30,8 @@ describe('provider errors are parsed, classified, and come with advice', () => {
     ['provider.invalid-request', 'maximum context length is 128000 tokens', 'context_length', /too large for the model's context/],
     ['unknown', 'Invalid API key provided', 'auth', /opencode auth login/],
     ['unknown', 'read ECONNRESET', 'network', /Network problem/],
-    ['provider.invalid-request', 'only "auto" is supported for tool_choice', 'invalid_request', /rejected the request/],
+    ['provider.invalid-request', 'only "auto" is supported for tool_choice', 'step_limit', /forced `tool_choice`/],
+    ['provider.invalid-request', 'Invalid request: unsupported parameter temperature', 'invalid_request', /rejected the request/],
     ['unknown', 'output token limit reached', 'output_limit', /output-token limit/],
   ];
   for (const [type, msg, kind, advice] of cases) test(`${kind}: "${msg.slice(0, 40)}"`, async () => {
@@ -108,9 +109,9 @@ describe('automatic retry only where it is safe', () => {
 
 describe('time limits, cancel, process groups', () => {
   test('timeout kills the run, status "timeout", message and advice, partial output kept', async () => {
-    const { s, id } = await begin({ FAKE_SLEEP: '30' }, { timeout_minutes: 2 }); try {
+    const { s, id } = await begin({ FAKE_SLEEP: '30' }, { timeout_minutes: 8 }); try { // 800 ms: the detached runner needs a moment to start the client
       assert.match(await final(s, id), /^timeout \(timeout\)/);
-      const r = await s.text('opencode_result', { id }); assert.match(r, /^\[timeout: timeout\]\nno result after 200 ms; the process group was killed\nAdvice: Split the task/); assert.match(r, /--- partial output ---\nhello $/);
+      const r = await s.text('opencode_result', { id }); assert.match(r, /^\[timeout: timeout\]\nno result after 800 ms; the process group was killed\nAdvice: Split the task/); assert.match(r, /--- partial output ---\nhello $/);
     } finally { s.close(); }
   });
   test('a process that ignores SIGTERM is SIGKILLed after the grace period', async () => {
@@ -237,12 +238,24 @@ describe('prompt size and input validation', () => {
 });
 
 describe('shutdown', () => {
-  for (const how of ['stdin closed', 'SIGTERM']) test(`${how}: running tasks and their children are killed, the server exits`, async () => {
+  for (const how of ['stdin closed', 'SIGTERM']) test(`${how}: the server exits, the detached task and its children keep running (v0.6)`, async () => {
     const pf = join(tmp(), 'pid'); const { s, id } = await begin({ FAKE_SLEEP: '60', FAKE_CHILD_PIDFILE: pf }, { prompt: 'q'.repeat(120_000) }); try {
       const pid = await waitFor(() => existsSync(pf) && readFileSync(pf, 'utf8'), 5000); assert.ok(alive(pid));
       const exited = new Promise((r) => s.child.once('exit', (code, sig) => r({ code, sig })));
       if (how === 'SIGTERM') s.child.kill('SIGTERM'); else s.child.stdin.end();
-      const e = await Promise.race([exited, sleep(5000).then(() => 'timeout')]); assert.notEqual(e, 'timeout', 'server exited'); await waitFor(() => !alive(pid), 3000, 50);
+      const e = await Promise.race([exited, sleep(5000).then(() => 'timeout')]); assert.notEqual(e, 'timeout', 'server exited');
+      await sleep(600); assert.ok(alive(pid), 'the opencode child outlives the bridge');
+      // a new bridge instance on the same state directory sees the task and can cancel it
+      const s2 = startServer({ env: { ...FAST, OPENCODE_BRIDGE_STATE_DIR: s.stateDir, OPENCODE_BRIDGE_ROOT: s.rootDir } }); try {
+        assert.match(await s2.text('opencode_status', { id }), /^running /); assert.match(await s2.text('opencode_list'), new RegExp(`${id} running .*\\[earlier bridge instance\\]`));
+        assert.equal(await s2.text('opencode_cancel', { id }), 'cancelled'); await waitFor(() => !alive(pid), 5000, 50); assert.match(await s2.text('opencode_status', { id }), /^cancelled/);
+      } finally { s2.close(); }
+    } finally { s.close(); }
+  });
+  test('OPENCODE_BRIDGE_KILL_ON_EXIT=1 restores the old behaviour: tasks are cancelled when the bridge exits', async () => {
+    const pf = join(tmp(), 'pid'); const { s, id } = await begin({ FAKE_SLEEP: '60', FAKE_CHILD_PIDFILE: pf, OPENCODE_BRIDGE_KILL_ON_EXIT: '1' }); try {
+      const pid = await waitFor(() => existsSync(pf) && readFileSync(pf, 'utf8'), 5000); assert.ok(alive(pid)); s.child.stdin.end(); await waitFor(() => !alive(pid), 5000, 50);
+      const t = JSON.parse(readFileSync(join(s.stateDir, 'tasks', id, 'task.json'), 'utf8')); await waitFor(() => JSON.parse(readFileSync(join(s.stateDir, 'tasks', id, 'task.json'), 'utf8')).status === 'cancelled', 4000, 50);
     } finally { s.close(); }
   });
   test('the server survives a client that sends junk after a tool error', async () => {
@@ -289,7 +302,7 @@ describe('failure reasons and limits in session output', () => {
   test('a failed session shows the failure kind, message and advice in the header, and the error lines', async () => {
     const s = startServer(); try {
       const t = await s.text('opencode_session_output', { id: 'ses_012' }); const h = lines(t);
-      assert.match(h[0], /^ses_012  failed /); assert.ok(t.includes('failure: invalid_request: provider.invalid-request: only "auto" is supported for tool_choice')); assert.match(t, /\nadvice: The provider rejected the request/);
+      assert.match(h[0], /^ses_012  failed /); assert.ok(t.includes('failure: step_limit: provider.invalid-request: only "auto" is supported for tool_choice')); assert.match(t, /\nadvice: The provider rejected a forced `tool_choice`/);
       assert.match(t, /✖ error: provider\.invalid-request: only "auto"/); assert.match(t, /— idle \(failed\) —\n  ✖ error:/);
     } finally { s.close(); }
   });
@@ -303,7 +316,7 @@ describe('failure reasons and limits in session output', () => {
     const s = startServer(); try { for (const id of ['ses_000', 'ses_010', 'ses_001']) assert.ok(!/\nfailure:|✖ error/.test(await s.text('opencode_session_output', { id })), id); } finally { s.close(); }
   });
   test('last mode on a failed session still reports the failure in the header', async () => {
-    const s = startServer(); try { assert.match(await s.text('opencode_session_output', { id: 'ses_012', mode: 'last' }), /\nfailure: invalid_request:/); } finally { s.close(); }
+    const s = startServer(); try { assert.match(await s.text('opencode_session_output', { id: 'ses_012', mode: 'last' }), /\nfailure: step_limit:/); } finally { s.close(); }
   });
 });
 

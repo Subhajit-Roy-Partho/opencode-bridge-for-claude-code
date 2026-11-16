@@ -6,7 +6,8 @@ import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { startServer, waitFor, sleep } from './helpers.mjs';
+import { join } from 'node:path';
+import { startServer, waitFor, sleep, tmp, reapState } from './helpers.mjs';
 
 const LIVE = process.env.OPENCODE_BRIDGE_LIVE === '1';
 const skip = LIVE ? false : 'set OPENCODE_BRIDGE_LIVE=1 to run the live tests';
@@ -15,7 +16,7 @@ const created = new Set();
 const api = (m, p) => JSON.parse(execFileSync('opencode', ['api', m, p], { encoding: 'utf8', maxBuffer: 1 << 28 }) || '{}');
 
 describe('live service', { skip }, () => {
-  let s, root; before(() => { root = process.cwd(); s = startServer({ fake: false, root, env: { HOME: process.env.HOME } }); });
+  let s, root; before(() => { root = process.cwd(); s = startServer({ fake: false, root, env: { HOME: process.env.HOME, OPENCODE_BRIDGE_STATE_DIR: join(tmp(), 'state') } }); });
   after(() => { for (const id of created) { try { execFileSync('opencode', ['api', 'DELETE', `/api/session/${id}`], { stdio: 'ignore' }); } catch {} } s.close(); });
 
   test('opencode_policy answers for the real working directory', async () => {
@@ -63,5 +64,48 @@ describe('live service', { skip }, () => {
     const before = await count();
     const r = await s.call('opencode_start', { prompt: 'x', tier: 'hard', agent: 'explorer', cwd: root }); assert.equal(r.isError, true);
     assert.match(r.content[0].text, /tier "hard" stays on Claude/); await sleep(500); assert.equal(await count(), before, 'no session was created');
+  });
+});
+
+// v0.6: one short real job per behaviour (restart survival, cancellation through the service, the step-limit fallback)
+describe('live service: v0.6 recovery', { skip }, () => {
+  const root = process.cwd(); const state = join(tmp(), 'state'); const env = { HOME: process.env.HOME, OPENCODE_BRIDGE_STATE_DIR: state };
+  const lane2 = 'BRIDGELIVE' + randomBytes(2).toString('hex').toUpperCase();
+  after(() => { reapState(state); for (const id of created) { try { execFileSync('opencode', ['api', 'DELETE', `/api/session/${id}`], { stdio: 'ignore' }); } catch {} } });
+  const poll = async (s, id, re, ms = 180000) => waitFor(async () => { const x = await s.text('opencode_result', { id, wait_s: 10 }); return re.test(x) && x; }, ms, 200);
+
+  test('a task survives the bridge that started it: a new bridge instance reads the result', async () => {
+    const s1 = startServer({ fake: false, root, env }); const out = await s1.text('opencode_start', { prompt: 'Reply with exactly the single word PONGTWO. Do not use tools. Do not touch files.', tier: 'easy', agent: 'explorer', lane: lane2, cwd: root });
+    const id = out.match(/task (\w+) started/)[1]; const sid = (await waitFor(async () => (await s1.text('opencode_status', { id })).match(/session (ses_\w+)/), 60000))[1]; created.add(sid);
+    s1.child.stdin.end(); s1.child.kill(); await sleep(300); // the bridge is gone; the run is not
+    const s2 = startServer({ fake: false, root, env }); try {
+      assert.match(await s2.text('opencode_list'), new RegExp(`${id} .*\\[earlier bridge instance\\]`)); assert.match(await poll(s2, id, /^\[done\]/), /PONGTWO/);
+      assert.match(await s2.text('opencode_sessions', { title_prefix: `${lane2}/` }), new RegExp(`${sid}\\s+succeeded`));
+    } finally { s2.child.stdin.end(); s2.child.kill(); }
+  });
+  test('the built-in worker (private --standalone instance) runs detached too', async () => {
+    const s = startServer({ fake: false, root, env }); try {
+      const out = await s.text('opencode_start', { prompt: 'Reply with exactly the single word PONGW. Do not use tools. Do not touch files.', tier: 'easy', agent: 'worker', lane: lane2, cwd: root, wait_s: 20 });
+      const id = out.match(/task (\w+) started/)[1]; const r = await poll(s, id, /^\[done\]/, 120000); assert.match(r, /PONGW/);
+      const sid = (await s.text('opencode_status', { id })).match(/session (ses_\w+)/)?.[1]; if (sid) created.add(sid);
+    } finally { s.close(); }
+  });
+  test('opencode_cancel interrupts a real session through the service; it is listed as cancelled', async () => {
+    const s = startServer({ fake: false, root, env }); try {
+      const out = await s.text('opencode_start', { prompt: 'Read EVERY file under docs/ and rust/src/ one at a time, one read call per file (at least 12 separate calls), then write one paragraph per file. Do not stop early.', tier: 'easy', agent: 'explorer', lane: lane2, cwd: root });
+      const id = out.match(/task (\w+) started/)[1]; const sid = (await waitFor(async () => (await s.text('opencode_status', { id })).match(/session (ses_\w+)/), 60000))[1]; created.add(sid);
+      await waitFor(() => JSON.parse(execFileSync('opencode', ['api', 'GET', '/api/session/active'], { encoding: 'utf8' })).data?.[sid], 60000, 300); await sleep(1500); // the service is running it
+      const c = await s.text('opencode_cancel', { id }); assert.match(c, /^cancelled\nsession ses_\w+ interrupted through the service/);
+      await waitFor(async () => /^cancelled/.test(await s.text('opencode_status', { id })), 20000, 200);
+      const svc = JSON.parse(execFileSync('opencode', ['api', 'GET', `/api/session/${sid}`], { encoding: 'utf8' })).data; assert.equal(svc.outcome, 'interrupted'); // what the service itself says
+      assert.match(await s.text('opencode_sessions', { title_prefix: `${lane2}/`, state: 'cancelled' }), new RegExp(sid)); assert.match(await s.text('opencode_session_output', { id: sid }), /^ses_\w+  cancelled /);
+    } finally { s.close(); }
+  });
+  test('the step-limit failure (explorer steps:15 -> forced tool_choice rejected) ends in a report through the in-session fallback', { skip: process.env.OPENCODE_BRIDGE_LIVE_STEPS === '1' ? false : 'set OPENCODE_BRIDGE_LIVE_STEPS=1 (needs the explorer agent to have a steps limit; ~35 tool calls)' }, async () => {
+    const s = startServer({ fake: false, root, env }); try {
+      const out = await s.text('opencode_start', { prompt: 'Read EVERY file under docs/ and rust/src/ one at a time, one read call per file (at least 20 separate calls), then write a 3-line summary.', tier: 'easy', agent: 'explorer', lane: lane2, cwd: root });
+      const id = out.match(/task (\w+) started/)[1]; const r = await poll(s, id, /^\[(done|failed)/, 600000); const st = await s.text('opencode_status', { id }); const sid = st.match(/session (ses_\w+)/)?.[1]; if (sid) created.add(sid);
+      assert.match(st, /^done/); assert.match(st, /fallback: finalize-in-session/); assert.match(r, /fallback used: finalize-in-session/);
+    } finally { s.close(); }
   });
 });

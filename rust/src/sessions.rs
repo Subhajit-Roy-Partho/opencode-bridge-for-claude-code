@@ -1,6 +1,7 @@
 // Read-only view of every opencode session (list, output) plus rename: all through `opencode api`.
 use crate::api::api;
 use crate::config::*;
+use crate::state::is_cancelled_session;
 use crate::util::*;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -10,7 +11,12 @@ fn truthy(v: &Value) -> bool { match v { Value::Null => false, Value::Bool(b) =>
 fn upd_of(s: &Value) -> i64 { s["time"]["updated"].as_f64().or_else(|| s["time"]["created"].as_f64()).unwrap_or(0.0) as i64 }
 
 fn state_of(s: &Value, active: &HashSet<String>) -> String {
-    if let Some(o) = s["outcome"].as_str().filter(|o| !o.is_empty()) { return o.to_string(); }
+    if let Some(o) = s["outcome"].as_str().filter(|o| !o.is_empty()) {
+        if o == "interrupted" {
+            if let Some(id) = s["id"].as_str() { if is_cancelled_session(id) { return "cancelled".into(); } }
+        }
+        return o.to_string();
+    }
     if s["id"].as_str().map(|i| active.contains(i)).unwrap_or(false) { return "running".into(); }
     if (now_ms() - upd_of(s)) as f64 / 60000.0 > stale_min() { "stale?".into() } else { "running".into() }
 }
@@ -140,9 +146,11 @@ pub fn session_output(a: &Value) -> Result<String, String> {
     let st = state_of(&s, &act);
     let fail_raw = newest_first.iter().map(|m| &m["error"]).find(|e| truthy(e));
     let failure = fail_raw.map(|e| { let msg = err_text(e); let c = classify(&msg); format!("\nfailure: {}: {}{}", c.kind, clip(&msg, 300), if c.advice.is_empty() { String::new() } else { format!("\nadvice: {}", c.advice) }) }).unwrap_or_default();
+    let why = if st == "interrupted" { "\nnote: interrupted = stopped before it finished (its client or the opencode service was stopped or restarted, or someone interrupted it); this is not a provider failure and the work so far is below. A read-only run can be continued (opencode_resume on its bridge task, or a new task with this output); for an editing run check git status first." }
+        else if st == "cancelled" { "\nnote: cancelled through the bridge (opencode_cancel); the service records it as interrupted." } else { "" };
     let tok = |key: &str| k(s["tokens"][key].as_f64().unwrap_or(0.0));
-    let head = format!("{}  {}  {}  updated {} ago  {}/{} tok\n{}  |  {}{}", s["id"].as_str().unwrap_or("undefined"), st, s["agent"].as_str().unwrap_or("undefined"), ago(upd_of(&s)), tok("input"), tok("output"),
-        tail_path(s["location"]["directory"].as_str().unwrap_or(""), 4), s["title"].as_str().unwrap_or("undefined"), failure);
+    let head = format!("{}  {}  {}  updated {} ago  {}/{} tok\n{}  |  {}{}{}", s["id"].as_str().unwrap_or("undefined"), st, s["agent"].as_str().unwrap_or("undefined"), ago(upd_of(&s)), tok("input"), tok("output"),
+        tail_path(s["location"]["directory"].as_str().unwrap_or(""), 4), s["title"].as_str().unwrap_or("undefined"), failure, why);
     let mut body: String;
     if mode == "last" {
         let mut last = String::new();
