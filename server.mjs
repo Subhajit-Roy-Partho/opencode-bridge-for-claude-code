@@ -435,7 +435,7 @@ async function reconcile(t, ev) {
 }
 
 const elapsed = (t) => Math.round(((isFinal(t.status) ? t.ended ?? Date.now() : Date.now()) - t.started) / 1000);
-function liveTasks() { return registry().sort((x, y) => x.started - y.started).filter((t) => !isFinal(t.status) && (pidAlive(t.runner) || pidAlive(t.child) || (!t.runner && Date.now() - t.started < 15000)) && (t.bridge?.pid === process.pid || !pidAlive(t.bridge))); }
+function liveTasks() { return registry().sort((x, y) => x.started - y.started).filter((t) => !isFinal(t.status) && !existsSync(join(tdir(t.id), 'cancelled')) && (pidAlive(t.runner) || pidAlive(t.child) || (!t.runner && Date.now() - t.started < 15000)) && (t.bridge?.pid === process.pid || !pidAlive(t.bridge))); }
 function gitStatus(cwd) { try { return execFileSync('git', ['-C', cwd, 'status', '--short'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '(clean: no changes)'; } catch { return '(not a git repository, or git is unavailable: check the files yourself)'; } }
 
 let lastStart = 0;

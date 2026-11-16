@@ -248,7 +248,7 @@ describe('shutdown', () => {
       // a new bridge instance on the same state directory sees the task and can cancel it
       const s2 = startServer({ env: { ...FAST, OPENCODE_BRIDGE_STATE_DIR: s.stateDir, OPENCODE_BRIDGE_ROOT: s.rootDir } }); try {
         assert.match(await s2.text('opencode_status', { id }), /^running /); assert.match(await s2.text('opencode_list'), new RegExp(`${id} running .*\\[earlier bridge instance\\]`));
-        assert.equal(await s2.text('opencode_cancel', { id }), 'cancelled'); await waitFor(() => !alive(pid), 5000, 50); assert.match(await s2.text('opencode_status', { id }), /^cancelled/);
+        assert.equal(await s2.text('opencode_cancel', { id }), 'cancelled'); await waitFor(() => !alive(pid), 5000, 50); await waitFor(async () => /^cancelled/.test(await s2.text('opencode_status', { id })), 5000, 50); assert.match(await s2.text('opencode_status', { id }), /^cancelled/);
       } finally { s2.close(); }
     } finally { s.close(); }
   });

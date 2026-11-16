@@ -10,6 +10,7 @@ Robustness against client-side timeouts, restarts and interrupted sessions. Root
 - **Cancellation through the service**: `opencode_cancel` calls `POST /api/session/{id}/interrupt` and stops the client's process group; task and session are listed as `cancelled`, not `interrupted` (`opencode_sessions state=cancelled`). `id` may be a session id that no bridge task owns.
 - `opencode_status` flags a running task whose output has been quiet for 45 minutes (`stale?`); task directories older than 14 days are pruned at start-up.
 - Tests: 227 offline (34 new in `test/recovery.test.mjs`, a simulated service in the fake opencode), live tests for restart survival, cancel through the service, the detached worker and (opt-in) the step-limit job.
+- Fixed after CI: a cancelled task now frees its parallel slot at once (it counted until its runner exited); the Rust runner noticed a finished child and a cancel only every 250 ms, now within ~10 ms.
 - Fixed while testing: a snapshot that raced the runner's final write could overwrite `done` with `lost`; a snapshot now reads the record again after it saw the runner exit, and reconcile never overwrites a final state.
 
 ## 0.5.0

@@ -183,7 +183,15 @@ pub fn run(dir: &str) -> ! {
                         let _ = child.wait();
                         break;
                     }
-                    Ok(None) => std::thread::sleep(Duration::from_millis(250)),
+                    Ok(None) => {
+                        // the heavier checks above run every 250 ms; the child's exit and a cancel are noticed within ~10 ms
+                        let until = std::time::Instant::now() + Duration::from_millis(250);
+                        while std::time::Instant::now() < until {
+                            std::thread::sleep(Duration::from_millis(10));
+                            if STOP.load(Ordering::SeqCst) || r.cancelled() { break; }
+                            if !matches!(child.try_wait(), Ok(None)) { break; }
+                        }
+                    }
                     Err(_) => break,
                 }
             }

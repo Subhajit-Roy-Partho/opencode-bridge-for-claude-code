@@ -216,6 +216,8 @@ pub fn live_tasks() -> Vec<Value> {
     let mut v: Vec<Value> = registry().into_iter().filter(|t| {
         let st = t.get("status").and_then(|v| v.as_str()).unwrap_or("");
         if !live_status(st) { return false; }
+        // a cancelled task frees its slot at once, before its runner has finished writing the final state
+        if let Some(id) = t.get("id").and_then(|v| v.as_str()) { if std::path::Path::new(&format!("{}/cancelled", tdir(id))).exists() { return false; } }
         let has_runner_field = t.get("runner").map(|r| !r.is_null()).unwrap_or(false);
         let runner_up = pid_alive(&t.get("runner").cloned().unwrap_or(Value::Null));
         let child_up = pid_alive(&t.get("child").cloned().unwrap_or(Value::Null));
